@@ -1,0 +1,878 @@
+\documentclass[UTF8,a4paper,12pt]{ctexart}
+
+\usepackage{amsmath,amssymb,bm}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{graphicx}
+
+\geometry{left=2.5cm,right=2.5cm,top=2.6cm,bottom=2.6cm}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.35em}
+\renewcommand{\arraystretch}{1.25}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue
+}
+
+\title{\textbf{CG-MOACO 算法创新点与整体步骤整理}}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section*{0. 算法名称与基本思想}
+
+本文算法名称为：
+
+\begin{center}
+\textbf{CG-MOACO：Conflict-Graph-Guided Multiobjective Ant Colony Optimization}
+\end{center}
+
+中文名称为：
+
+\begin{center}
+\textbf{基于任务--卫星--窗口三元冲突图引导的多目标蚁群优化算法}
+\end{center}
+
+该算法面向多敏捷地球观测卫星任务调度问题。其核心思想是：首先将原始观测任务、卫星和可见时间窗口编码为``任务--卫星--窗口''三元候选节点；然后根据任务唯一性、同星时间冲突和姿态机动约束构建冲突图；最后将冲突图信息嵌入蚂蚁构造解、Pareto 档案信息素更新和局部搜索过程，从而提高可行解生成能力和 Pareto 解集质量。
+
+\newpage
+
+\section{四个创新点}
+
+\subsection{创新点一：任务--卫星--窗口三元冲突图建模}
+
+\subsubsection{三元节点定义}
+
+在敏捷卫星调度问题中，同一个任务通常可以由不同卫星执行，也可以在不同可见时间窗口内执行。因此，本文不直接将``任务''作为优化节点，而是将一个具体的候选观测方案定义为：
+
+\begin{equation}
+v_{j,i,k}=(task_j,sat_i,window_k)
+\end{equation}
+
+其中，各符号含义如下：
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+符号 & 含义 \\
+\midrule
+$task_j$ & 第 $j$ 个观测任务 \\
+$sat_i$ & 第 $i$ 颗卫星 \\
+$window_k$ & 该卫星对该任务的第 $k$ 个可见时间窗口 \\
+$v_{j,i,k}$ & 一个任务--卫星--窗口三元候选节点 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+选中一个节点 $v_{j,i,k}$，表示任务 $j$ 被安排给卫星 $i$，并在第 $k$ 个可见时间窗口内执行。
+
+\subsubsection{冲突图定义}
+
+在所有候选三元节点的基础上，构建冲突图：
+
+\begin{equation}
+G=(V,E)
+\end{equation}
+
+其中，$V$ 表示所有任务--卫星--窗口候选节点集合，$E$ 表示冲突边集合。若：
+
+\begin{equation}
+(v_a,v_b)\in E
+\end{equation}
+
+则表示候选节点 $v_a$ 和 $v_b$ 不能同时被选择。
+
+\subsubsection{冲突边构建规则}
+
+若两个候选节点 $v_a$ 和 $v_b$ 满足以下任意一种情况，则在二者之间添加冲突边。
+
+\paragraph{规则 1：同一任务重复观测冲突}
+
+同一个任务最多只能被执行一次。若：
+
+\begin{equation}
+task(v_a)=task(v_b)
+\end{equation}
+
+则：
+
+\begin{equation}
+(v_a,v_b)\in E
+\end{equation}
+
+该约束表示两个候选节点对应同一个任务，不能同时选择。
+
+\paragraph{规则 2：同一卫星时间窗口重叠冲突}
+
+若两个节点由同一颗卫星执行：
+
+\begin{equation}
+sat(v_a)=sat(v_b)
+\end{equation}
+
+且时间窗口发生重叠：
+
+\begin{equation}
+[st_a,et_a]\cap[st_b,et_b]\neq \emptyset
+\end{equation}
+
+则：
+
+\begin{equation}
+(v_a,v_b)\in E
+\end{equation}
+
+该约束表示同一颗卫星不能在重叠时间内执行两个观测任务。
+
+\paragraph{规则 3：姿态机动时间不足冲突}
+
+对于同一颗卫星上的两个连续观测节点 $v_a$ 和 $v_b$，需要满足姿态转移时间约束：
+
+\begin{equation}
+et_a+Tr_{a,b}^{i}\leq st_b
+\end{equation}
+
+其中，$et_a$ 表示节点 $v_a$ 的观测结束时间，$st_b$ 表示节点 $v_b$ 的观测开始时间，$Tr_{a,b}^{i}$ 表示卫星 $i$ 从任务 $a$ 转向任务 $b$ 所需的姿态机动时间。
+
+若：
+
+\begin{equation}
+et_a+Tr_{a,b}^{i}>st_b
+\end{equation}
+
+则：
+
+\begin{equation}
+(v_a,v_b)\in E
+\end{equation}
+
+该约束表示卫星在两个任务之间来不及完成姿态调整，因此两个节点不能同时选择。
+
+\subsubsection{可行解与独立集关系}
+
+一个调度方案可以表示为节点集合：
+
+\begin{equation}
+X\subseteq V
+\end{equation}
+
+若 $X$ 中任意两个节点之间都不存在冲突边，则该方案是可行的：
+
+\begin{equation}
+\forall v_a,v_b\in X,\quad (v_a,v_b)\notin E
+\end{equation}
+
+也可以写成：
+
+\begin{equation}
+|E_X|=0
+\end{equation}
+
+其中，$E_X$ 是由解 $X$ 中节点诱导出的冲突边集合。因此，一个可行调度方案等价于冲突图 $G$ 中的一个独立集。
+
+\subsubsection{创新点总结}
+
+该创新点的核心在于：将卫星调度中的任务唯一性、时间窗口重叠和姿态机动约束统一表示为候选节点之间的冲突边，使复杂约束转化为图结构中的邻接关系，从而便于后续算法快速判断可行性、筛选候选节点和执行局部搜索。
+
+\subsection{创新点二：冲突图引导的蚁群构造机制}
+
+\subsubsection{蚂蚁构造解的基本过程}
+
+蚂蚁从空解开始，逐步选择任务--卫星--窗口候选节点，构造一个调度方案：
+
+\begin{equation}
+X=\{v_1,v_2,\dots,v_q\}
+\end{equation}
+
+在当前部分解 $X$ 下，仍可选择的候选节点集合记为：
+
+\begin{equation}
+A(X)
+\end{equation}
+
+若某个候选节点 $v$ 与当前解中任意节点冲突，则不应被加入当前解。可行性判断为：
+
+\begin{equation}
+N(v)\cap X=\emptyset
+\end{equation}
+
+其中，$N(v)$ 表示冲突图中节点 $v$ 的邻居集合。若 $N(v)\cap X=\emptyset$，说明节点 $v$ 与当前部分解无冲突，可以加入当前调度方案。
+
+\subsubsection{节点选择概率}
+
+蚂蚁在候选集合 $A(X)$ 中选择下一个节点 $v$ 的概率为：
+
+\begin{equation}
+P(v)=
+\frac{\tau(v)^{\alpha}\eta(v)^{\beta}}
+{\sum_{u\in A(X)}\tau(u)^{\alpha}\eta(u)^{\beta}}
+\end{equation}
+
+其中：
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+符号 & 含义 \\
+\midrule
+$P(v)$ & 节点 $v$ 被选中的概率 \\
+$\tau(v)$ & 节点 $v$ 上的信息素 \\
+$\eta(v)$ & 节点 $v$ 的启发式吸引力 \\
+$\alpha$ & 信息素影响因子 \\
+$\beta$ & 启发式信息影响因子 \\
+$A(X)$ & 当前仍然可以选择的候选节点集合 \\
+$u$ & 候选集合中的任意节点 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+公式中，分子 $\tau(v)^\alpha\eta(v)^\beta$ 表示某一个具体候选节点 $v$ 的综合吸引力；分母表示当前所有可选节点综合吸引力之和。因此，$P(v)$ 表示节点 $v$ 在所有可选候选节点中的相对选择概率。
+
+\subsubsection{冲突图启发式函数}
+
+本文设计的冲突图启发式函数为：
+
+\begin{equation}
+\eta(v)=
+\frac{\hat{p}(v)+\lambda_1\hat{R}(v)}
+{1+\lambda_2\hat{C}(v)+\lambda_3\hat{M}(v)+\lambda_4\hat{L}(s_i)}
+\end{equation}
+
+其中：
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+符号 & 含义 \\
+\midrule
+$\hat{p}(v)$ & 节点 $v$ 对应任务收益的归一化值 \\
+$\hat{R}(v)$ & 节点 $v$ 的窗口稀缺度归一化值 \\
+$\hat{C}(v)$ & 节点 $v$ 的冲突度归一化值 \\
+$\hat{M}(v)$ & 节点 $v$ 的姿态机动代价归一化值 \\
+$\hat{L}(s_i)$ & 卫星 $s_i$ 当前负载归一化值 \\
+$\lambda_1,\lambda_2,\lambda_3,\lambda_4$ & 各因素的权重系数 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+分子：
+
+\begin{equation}
+\hat{p}(v)+\lambda_1\hat{R}(v)
+\end{equation}
+
+表示希望优先选择的因素。其中，收益越高、窗口越稀缺，节点越应该被优先选择。
+
+分母：
+
+\begin{equation}
+1+\lambda_2\hat{C}(v)+\lambda_3\hat{M}(v)+\lambda_4\hat{L}(s_i)
+\end{equation}
+
+表示需要抑制的因素。其中，冲突越多、姿态机动代价越高、当前卫星负载越高，节点越不应该被优先选择。
+
+因此，该启发式函数倾向于选择高收益、窗口稀缺、冲突少、姿态机动代价低且有利于负载均衡的候选节点。
+
+\subsubsection{创新点总结}
+
+普通 MOACO 通常只依赖信息素和简单收益启发式，而本文将冲突图中的冲突度、任务窗口稀缺性、姿态机动代价和卫星负载状态共同嵌入启发式函数，使蚂蚁在构造解时能够主动规避高冲突节点，提高可行解生成效率。
+
+\subsection{创新点三：冲突图感知的 Pareto 档案信息素更新策略}
+
+\subsubsection{Pareto 外部档案}
+
+算法维护一个 Pareto 外部档案：
+
+\begin{equation}
+Archive=\{X_1,X_2,\dots,X_m\}
+\end{equation}
+
+其中，每个 $X_r$ 都是当前搜索过程中得到的非支配解。
+
+对于两个解 $X_a$ 和 $X_b$，若满足：
+
+\begin{equation}
+f_l(X_a)\leq f_l(X_b),\quad \forall l
+\end{equation}
+
+且至少存在一个目标 $q$，使得：
+
+\begin{equation}
+f_q(X_a)<f_q(X_b)
+\end{equation}
+
+则称 $X_a$ 支配 $X_b$。
+
+\subsubsection{信息素挥发}
+
+每轮迭代结束后，所有节点上的信息素先进行挥发：
+
+\begin{equation}
+\tau(v)\leftarrow (1-\rho)\tau(v)
+\end{equation}
+
+其中，$\rho$ 为信息素挥发系数。信息素挥发的作用是避免算法过早收敛到局部区域。
+
+\subsubsection{基于 Pareto 档案和图贡献的信息素增强}
+
+本文的信息素更新公式为：
+
+\begin{equation}
+\tau^{t+1}(v)
+=
+(1-\rho)\tau^t(v)
++
+\sum_{X\in Archive,\ v\in X}
+Q\cdot \omega(X)\cdot \phi(v)
+\end{equation}
+
+其中：
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+符号 & 含义 \\
+\midrule
+$\tau^{t}(v)$ & 第 $t$ 轮迭代中节点 $v$ 的信息素 \\
+$\tau^{t+1}(v)$ & 第 $t+1$ 轮迭代中节点 $v$ 的信息素 \\
+$\rho$ & 信息素挥发系数 \\
+$Q$ & 信息素增强常数 \\
+$Archive$ & Pareto 外部档案 \\
+$\omega(X)$ & 解 $X$ 的 Pareto 贡献 \\
+$\phi(v)$ & 节点 $v$ 的冲突图贡献 \\
+$v\in X$ & 节点 $v$ 出现在非支配解 $X$ 中 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+该公式表示：只有出现在 Pareto 档案优秀解中的节点才会获得信息素增强，而且增强程度还与该节点的冲突图贡献有关。
+
+\subsubsection{节点冲突图贡献}
+
+节点 $v$ 的冲突图贡献可以定义为：
+
+\begin{equation}
+\phi(v)=
+\frac{\hat{p}(v)+\lambda_1\hat{R}(v)}
+{1+\lambda_2\hat{C}(v)+\lambda_3\hat{M}(v)}
+\end{equation}
+
+该贡献函数表示：在 Pareto 优秀解中，高收益、窗口稀缺、低冲突、低机动代价的节点应获得更多信息素强化。
+
+\subsubsection{与普通 MOACO 的区别}
+
+普通 MOACO 中，若某个节点出现在优秀解中，通常采用统一的信息素奖励：
+
+\begin{equation}
+\tau(v)\leftarrow (1-\rho)\tau(v)+Q
+\end{equation}
+
+而本文方法采用差异化更新：
+
+\begin{equation}
+\tau(v)\leftarrow (1-\rho)\tau(v)+Q\cdot \omega(X)\cdot \phi(v)
+\end{equation}
+
+其区别在于：普通 MOACO 主要依据节点是否出现在优秀解中进行更新，而 CG-MOACO 同时考虑节点是否出现在 Pareto 解中以及节点自身的冲突图贡献。
+
+\subsubsection{创新点总结}
+
+该创新点的核心是：Pareto 档案决定``哪些解值得学习''，冲突图贡献决定``这些优秀解中的哪些节点更值得强化''。因此，信息素更新不仅保留了多目标 Pareto 搜索经验，还能强化低冲突、高收益、低机动代价的关键节点，从而引导后续蚂蚁生成更高质量的可行解。
+
+\subsection{创新点四：冲突图感知快速插入--替换局部搜索策略}
+
+\subsubsection{局部搜索目的}
+
+蚂蚁构造出的解虽然可行，但可能仍存在以下问题：部分高价值任务未被安排、某些卫星负载不均衡、局部任务组合不是最优、低收益节点占用了关键时间窗口。为此，本文设计冲突图感知快速插入--替换局部搜索策略，对构造解进行进一步改进。
+
+\subsubsection{快速插入操作}
+
+对于当前解 $X$，首先找出未调度任务对应的候选节点集合：
+
+\begin{equation}
+U=\{v\in V \mid task(v)\notin task(X)\}
+\end{equation}
+
+对每个候选节点 $v\in U$，判断其是否可以直接插入当前解：
+
+\begin{equation}
+N(v)\cap X=\emptyset
+\end{equation}
+
+若成立，则：
+
+\begin{equation}
+X\leftarrow X\cup\{v\}
+\end{equation}
+
+该过程表示：如果节点 $v$ 与当前解中的所有节点都不冲突，则直接加入当前调度方案。
+
+\subsubsection{插入优先级排序}
+
+为了优先尝试更有价值的候选节点，可以定义插入优先级：
+
+\begin{equation}
+Priority(v)=
+\frac{\hat{p}(v)+\lambda_1\hat{R}(v)}
+{1+\lambda_2\hat{C}(v)+\lambda_3\hat{L}(s_i)}
+\end{equation}
+
+候选节点按照 $Priority(v)$ 从高到低排序，优先尝试高收益、低冲突、负载友好的节点。
+
+\subsubsection{替换操作}
+
+如果某个高价值节点 $v$ 无法直接插入，则利用冲突图快速找到其与当前解的冲突集合：
+
+\begin{equation}
+ConflictSet(v)=N(v)\cap X
+\end{equation}
+
+如果删除冲突节点后加入新节点能够得到更好的解，则执行替换：
+
+\begin{equation}
+X'=(X-ConflictSet(v))\cup\{v\}
+\end{equation}
+
+\subsubsection{多目标替换增益函数}
+
+为了判断替换是否值得接受，定义多目标替换增益：
+
+\begin{equation}
+MGain
+=
+w_1\Delta Profit
+-
+w_2\Delta Maneuver
+-
+w_3\Delta Load
+\end{equation}
+
+其中，$\Delta Profit$ 表示替换后的收益增加量，$\Delta Maneuver$ 表示替换后的姿态机动代价变化量，$\Delta Load$ 表示替换后的负载不均衡变化量，$w_1,w_2,w_3$ 表示三个指标的权重。若：
+
+\begin{equation}
+MGain>\theta
+\end{equation}
+
+则接受替换，其中 $\theta$ 是最小替换增益阈值。
+
+\subsubsection{基于正式目标函数的替换增益}
+
+由于本文最终优化目标均为最小化：
+
+\begin{equation}
+f_1=1-\frac{\sum_j\sum_i\sum_k p_jx_{j,i,k}}{\sum_jp_j}
+\end{equation}
+
+\begin{equation}
+f_2=\sum_i\sum_{(a,b)\in Seq_i}Tr_{a,b}^{i}
+\end{equation}
+
+\begin{equation}
+f_3=\sqrt{\frac{1}{|S|}\sum_{i\in S}(L_i-\bar{L})^2}
+\end{equation}
+
+因此也可以将替换增益写成目标函数改善量：
+
+\begin{equation}
+MGain
+=
+w_1(f_1^{old}-f_1^{new})
++
+w_2(f_2^{old}-f_2^{new})
++
+w_3(f_3^{old}-f_3^{new})
+\end{equation}
+
+其中，$f_1^{old}-f_1^{new}>0$ 表示未完成收益率下降，$f_2^{old}-f_2^{new}>0$ 表示姿态机动代价下降，$f_3^{old}-f_3^{new}>0$ 表示负载不均衡下降。该写法与最终 Pareto 目标函数更一致。
+
+\subsubsection{创新点总结}
+
+该创新点的核心是：不是盲目尝试所有插入和替换，而是利用冲突图快速判断候选节点能否插入，并在插入失败时直接定位冲突节点集合，从而实现快速替换修复。相比普通局部搜索，本文方法可以更快地识别阻碍高价值任务插入的冲突节点，提高局部改进效率。
+
+\newpage
+
+\section{算法整体步骤}
+
+\subsection{Step 1：输入原始数据}
+
+算法输入包括任务集合、卫星集合、每颗卫星对每个任务的可见时间窗口、任务收益、任务持续时间，以及姿态机动或转移时间参数。
+
+任务集合表示为：
+
+\begin{equation}
+T=\{task_1,task_2,\dots,task_n\}
+\end{equation}
+
+卫星集合表示为：
+
+\begin{equation}
+S=\{sat_1,sat_2,\dots,sat_m\}
+\end{equation}
+
+\subsection{Step 2：任务--卫星--窗口三元节点编码}
+
+根据任务、卫星和可见时间窗口生成候选节点集合：
+
+\begin{equation}
+V=\{v_{j,i,k}\mid task_j\in T,\ sat_i\in S,\ window_k\in W_{j,i}\}
+\end{equation}
+
+其中，$W_{j,i}$ 表示卫星 $i$ 对任务 $j$ 的可见时间窗口集合。
+
+若某个窗口长度不足以完成任务，即：
+
+\begin{equation}
+et_{j,i,k}-st_{j,i,k}<d_j
+\end{equation}
+
+则该候选节点直接删除，不进入节点集合。其中，$st_{j,i,k}$ 表示窗口开始时间，$et_{j,i,k}$ 表示窗口结束时间，$d_j$ 表示任务 $j$ 的观测持续时间。
+
+\subsection{Step 3：构建冲突图}
+
+根据候选节点集合 $V$，构建冲突图：
+
+\begin{equation}
+G=(V,E)
+\end{equation}
+
+对任意两个节点 $v_a,v_b\in V$，若满足同任务冲突、同星时间重叠冲突或姿态转移不足冲突，则添加冲突边：
+
+\begin{equation}
+(v_a,v_b)\in E
+\end{equation}
+
+冲突图构建完成后，可以得到每个节点的冲突邻居集合：
+
+\begin{equation}
+N(v)=\{u\in V\mid (v,u)\in E\}
+\end{equation}
+
+节点冲突度定义为：
+
+\begin{equation}
+C(v)=|N(v)|
+\end{equation}
+
+\subsection{Step 4：初始化参数和信息素}
+
+初始化每个候选节点上的信息素：
+
+\begin{equation}
+\tau(v)=\tau_0,\quad \forall v\in V
+\end{equation}
+
+其中，$\tau_0$ 是初始信息素，$\tau(v)$ 是节点 $v$ 上的信息素。
+
+初始化 Pareto 外部档案：
+
+\begin{equation}
+Archive=\emptyset
+\end{equation}
+
+\subsection{Step 5：蚂蚁构造调度方案}
+
+对于每只蚂蚁，从空解开始：
+
+\begin{equation}
+X=\emptyset
+\end{equation}
+
+在当前部分解 $X$ 下，计算可选节点集合：
+
+\begin{equation}
+A(X)=\{v\in V\mid task(v)\notin task(X),\ N(v)\cap X=\emptyset\}
+\end{equation}
+
+然后按照选择概率选择下一个节点：
+
+\begin{equation}
+P(v)=
+\frac{\tau(v)^{\alpha}\eta(v)^{\beta}}
+{\sum_{u\in A(X)}\tau(u)^{\alpha}\eta(u)^{\beta}}
+\end{equation}
+
+并将其加入当前解：
+
+\begin{equation}
+X\leftarrow X\cup\{v\}
+\end{equation}
+
+重复该过程，直到没有可选节点或达到构造停止条件。
+
+\subsection{Step 6：计算调度方案的三个目标函数}
+
+本文采用三个目标函数，均转化为最小化形式。
+
+\subsubsection{目标一：最小化未完成收益率}
+
+原始目标是最大化完成任务收益：
+
+\begin{equation}
+Profit(X)=\sum_j\sum_i\sum_k p_jx_{j,i,k}
+\end{equation}
+
+为了统一为最小化，定义未完成收益率：
+
+\begin{equation}
+f_1(X)=1-\frac{\sum_j\sum_i\sum_k p_jx_{j,i,k}}{\sum_jp_j}
+\end{equation}
+
+其中，$p_j$ 表示任务 $j$ 的收益，$x_{j,i,k}$ 表示节点 $v_{j,i,k}$ 是否被选择。$f_1(X)$ 越小，说明完成的收益越多。
+
+\subsubsection{目标二：最小化姿态机动代价}
+
+对每颗卫星的任务序列，计算相邻任务之间的姿态转移代价：
+
+\begin{equation}
+f_2(X)=\sum_{i\in S}\sum_{(a,b)\in Seq_i}Tr_{a,b}^{i}
+\end{equation}
+
+其中，$Seq_i$ 表示卫星 $i$ 的任务执行序列，$(a,b)$ 表示序列中相邻的两个任务，$Tr_{a,b}^{i}$ 表示卫星 $i$ 从任务 $a$ 转向任务 $b$ 的姿态机动时间或代价。
+
+\subsubsection{目标三：最小化负载不均衡度}
+
+定义每颗卫星的负载为：
+
+\begin{equation}
+L_i=|\{v\in X\mid sat(v)=sat_i\}|
+\end{equation}
+
+平均负载为：
+
+\begin{equation}
+\bar{L}=\frac{1}{|S|}\sum_{i\in S}L_i
+\end{equation}
+
+负载不均衡度定义为：
+
+\begin{equation}
+f_3(X)=
+\sqrt{
+\frac{1}{|S|}
+\sum_{i\in S}(L_i-\bar{L})^2
+}
+\end{equation}
+
+$f_3(X)$ 越小，说明不同卫星之间任务分配越均衡。
+
+\subsection{Step 7：更新 Pareto 外部档案}
+
+将当前蚂蚁构造并局部搜索后的解加入候选集合，根据 Pareto 支配关系更新外部档案。
+
+若新解 $X_{new}$ 不被档案中任意解支配，则加入档案；同时删除被 $X_{new}$ 支配的旧解：
+
+\begin{equation}
+Archive \leftarrow Archive-\{X\in Archive\mid X_{new}\prec X\}
+\end{equation}
+
+然后：
+
+\begin{equation}
+Archive\leftarrow Archive\cup \{X_{new}\}
+\end{equation}
+
+若档案超过最大容量，则可以根据拥挤距离等多样性指标删除过密区域的解。
+
+\subsection{Step 8：冲突图感知局部搜索}
+
+对构造得到的解 $X$，执行快速插入和替换操作。
+
+\paragraph{快速插入}
+
+对未调度候选节点 $v$，若：
+
+\begin{equation}
+N(v)\cap X=\emptyset
+\end{equation}
+
+则：
+
+\begin{equation}
+X\leftarrow X\cup\{v\}
+\end{equation}
+
+\paragraph{替换改进}
+
+若节点 $v$ 无法直接插入，则计算：
+
+\begin{equation}
+ConflictSet(v)=N(v)\cap X
+\end{equation}
+
+构造替换后解：
+
+\begin{equation}
+X'=(X-ConflictSet(v))\cup\{v\}
+\end{equation}
+
+若替换增益满足：
+
+\begin{equation}
+MGain>\theta
+\end{equation}
+
+则接受替换：
+
+\begin{equation}
+X\leftarrow X'
+\end{equation}
+
+\subsection{Step 9：基于 Pareto 档案更新信息素}
+
+每轮迭代结束后，根据 Pareto 外部档案和节点冲突图贡献更新信息素：
+
+\begin{equation}
+\tau^{t+1}(v)
+=
+(1-\rho)\tau^t(v)
++
+\sum_{X\in Archive,\ v\in X}
+Q\cdot \omega(X)\cdot \phi(v)
+\end{equation}
+
+其中：
+
+\begin{equation}
+\phi(v)=
+\frac{\hat{p}(v)+\lambda_1\hat{R}(v)}
+{1+\lambda_2\hat{C}(v)+\lambda_3\hat{M}(v)}
+\end{equation}
+
+若节点 $v$ 出现在 Pareto 档案中的优秀解中，则获得信息素奖励；若该节点收益高、窗口稀缺、冲突少、机动代价低，则获得更高奖励。
+
+\subsection{Step 10：迭代终止并输出结果}
+
+重复 Step 5 至 Step 9，直到达到最大迭代次数：
+
+\begin{equation}
+t=t_{max}
+\end{equation}
+
+最终输出 Pareto 外部档案：
+
+\begin{equation}
+Archive^*
+\end{equation}
+
+即算法得到的非支配调度方案集合：
+
+\begin{equation}
+Archive^*=\{X_1^*,X_2^*,\dots,X_r^*\}
+\end{equation}
+
+每个解对应一组目标函数值：
+
+\begin{equation}
+F(X)=\left(f_1(X),f_2(X),f_3(X)\right)
+\end{equation}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+目标 & 含义 & 优化方向 \\
+\midrule
+$f_1$ & 未完成收益率 & 越小越好 \\
+$f_2$ & 姿态机动代价 & 越小越好 \\
+$f_3$ & 负载不均衡度 & 越小越好 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\newpage
+
+\section{整体伪代码}
+
+\begin{verbatim}
+Input:
+    Task set T
+    Satellite set S
+    Visible time windows W
+    Algorithm parameters
+
+Output:
+    Pareto archive Archive*
+
+1. Encode raw data into task-satellite-window candidate nodes V
+2. Construct conflict graph G=(V,E)
+3. Initialize pheromone tau(v)=tau0 for all v in V
+4. Initialize Pareto archive Archive=empty
+
+5. For iteration t = 1 to tmax do
+
+6.     For each ant do
+
+7.         Initialize solution X=empty
+
+8.         While candidate set A(X) is not empty do
+
+9.             For each v in A(X), compute heuristic eta(v)
+
+10.            Select next node v according to:
+                   P(v)=tau(v)^alpha eta(v)^beta /
+                        sum_{u in A(X)} tau(u)^alpha eta(u)^beta
+
+11.            Add selected node:
+                   X <- X union {v}
+
+12.        End while
+
+13.        Apply conflict-graph-aware fast insertion and replacement local search
+
+14.        Evaluate solution:
+                   F(X)=(f1(X), f2(X), f3(X))
+
+15.        Update Pareto archive Archive
+
+16.    End for
+
+17.    Update pheromone using Pareto archive and graph contribution:
+               tau(v) <- (1-rho)tau(v)
+                         + sum_{X in Archive, v in X} Q omega(X) phi(v)
+
+18. End for
+
+19. Return Archive*
+\end{verbatim}
+
+\section{方法总结}
+
+本文提出的 CG-MOACO 算法的关键思想可以概括为：
+
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{用三元节点表达候选观测方案。} 将任务、卫星、时间窗口统一编码为候选节点，使调度决策更加精确。
+    \item \textbf{用冲突图表达复杂约束。} 将任务重复、时间重叠和姿态机动不可行等约束转化为冲突边，使可行性判断变为图邻接关系判断。
+    \item \textbf{用冲突图引导蚂蚁构造解。} 在节点选择概率中引入收益、窗口稀缺度、冲突度、姿态机动和负载因素，使蚂蚁优先选择高价值、低冲突的节点。
+    \item \textbf{用 Pareto 档案和冲突图共同更新信息素。} 不仅学习 Pareto 优秀解，还进一步区分优秀解中不同节点的图贡献。
+    \item \textbf{用冲突图加速局部插入与替换。} 通过 $N(v)\cap X$ 快速判断可插入性，并通过 $ConflictSet(v)$ 快速定位替换对象，提高局部搜索效率。
+\end{enumerate}
+
+整体上，CG-MOACO 不是简单地将蚁群算法应用于卫星调度问题，而是将调度约束结构显式建模为冲突图，并将冲突图信息贯穿于构造、学习和改进三个阶段，从而提升多目标调度性能。
+
+% === AUTO PARETO FIGURES START ===
+\clearpage
+\section*{Pareto 前沿图}
+\input{../compare/pareto_figures.tex}
+\input{../canshu/pareto_figures.tex}
+\input{../xiaorong/pareto_figures.tex}
+% === AUTO PARETO FIGURES END ===
+
+% === AUTO METRICS TABLES START ===
+\clearpage
+\section*{实验指标结果表}
+\input{../compare/metrics_table.tex}
+\input{../canshu/metrics_table.tex}
+\input{../xiaorong/metrics_table.tex}
+% === AUTO METRICS TABLES END ===
+
+\end{document}
