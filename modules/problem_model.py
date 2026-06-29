@@ -2,14 +2,15 @@
 
 三个目标均统一返回为“最小化”形式：
 
-1. f1：未完成收益率
-   f1 = 1 - scheduled_profit / total_profit
+1. f1：总收益目标
+   代码内部统一最小化目标，因此返回 f1 = -scheduled_profit。
    其中 scheduled_profit 表示当前调度方案完成任务的总收益。
-   f1 越小，说明完成收益越高。
+   f1 越小，等价于总收益越高。
 
 2. f2：姿态机动代价
-   由于当前数据集中没有完整的姿态转移矩阵，
-   这里用同一颗卫星上连续任务之间的目标坐标距离近似姿态机动代价。
+   优先使用候选节点中的滚转角和俯仰角计算姿态差，
+   并按分段函数计算姿态转换时间。
+   如果旧 CSV 中没有姿态角字段，则退回目标坐标距离近似。
    f2 越小，说明任务序列的姿态转换代价越低。
 
 3. f3：卫星负载不均衡度
@@ -29,13 +30,11 @@ from .domain import CandidateNode, Task
 # =========================================================
 # 默认问题模型参数
 # =========================================================
-# min_transition_time:
-#   两个连续任务之间的最小基础姿态转换时间。
+# use_attitude_transition_time:
+#   True 时优先使用 outputattitude 里的滚转角、俯仰角计算分段姿态转换时间。
 #
-# maneuver_time_per_degree:
-#   姿态机动代价的比例系数。
-#   当前代码使用目标坐标之间的欧氏距离近似姿态变化量，
-#   再乘以该系数得到额外机动代价。
+# min_transition_time / maneuver_time_per_degree:
+#   旧 CSV 没有姿态角字段时的兼容 fallback，使用目标坐标距离近似姿态转换时间。
 #
 # load_mode:
 #   负载计算方式。
@@ -45,8 +44,46 @@ from .domain import CandidateNode, Task
 DEFAULT_MODEL_PARAMS = {
     "min_transition_time": 5.0,
     "maneuver_time_per_degree": 0.2,
+    "use_attitude_transition_time": True,
     "load_mode": "task_count",  # 可选："task_count" 或 "duration"
 }
+
+
+def attitude_delta_degrees(
+    node_a: CandidateNode,
+    node_b: CandidateNode,
+) -> float | None:
+    """Return |roll_b - roll_a| + |pitch_b - pitch_a| in degrees.
+
+    Yaw is intentionally ignored according to the scheduling model.
+    For the previous observation, end_roll/end_pitch are used because the
+    transition starts after the actual observation segment finishes.
+    """
+
+    roll_a = node_a.end_roll if node_a.end_roll is not None else node_a.roll
+    pitch_a = node_a.end_pitch if node_a.end_pitch is not None else node_a.pitch
+    roll_b = node_b.roll
+    pitch_b = node_b.pitch
+
+    if roll_a is None or pitch_a is None or roll_b is None or pitch_b is None:
+        return None
+
+    return abs(roll_b - roll_a) + abs(pitch_b - pitch_a)
+
+
+def attitude_transition_time(delta_degrees: float) -> float:
+    """Piecewise attitude transition time in seconds."""
+
+    delta = abs(delta_degrees)
+    if delta <= 10.0:
+        return 35.0 / 3.0
+    if delta < 30.0:
+        return delta / 1.5 + 5.0
+    if delta < 60.0:
+        return delta / 2.0 + 10.0
+    if delta < 90.0:
+        return delta / 2.5 + 16.0
+    return delta / 3.0 + 22.0
 
 
 def estimate_transition_time(
@@ -75,6 +112,11 @@ def estimate_transition_time(
 
     # 合并默认参数和外部传入参数
     p = {**DEFAULT_MODEL_PARAMS, **(params or {})}
+
+    if p.get("use_attitude_transition_time", True):
+        delta = attitude_delta_degrees(node_a, node_b)
+        if delta is not None:
+            return attitude_transition_time(delta)
 
     # 使用目标坐标之间的欧氏距离近似姿态变化量
     dist = math.hypot(
@@ -159,6 +201,14 @@ def calculate_maneuver_cost(
 
     return total
 
+def node_load_amount(node: CandidateNode, load_mode: str) -> float:
+    if load_mode == "task_count":
+        return 1.0
+    if load_mode == "duration":
+        return float(node.task_duration)
+
+    raise ValueError(f"Unknown load_mode: {load_mode}")
+
 
 def calculate_load_balance(
     solution: Iterable[int],
@@ -166,66 +216,37 @@ def calculate_load_balance(
     satellite_ids: Sequence[int],
     load_mode: str = "task_count",
 ) -> float:
-    """计算卫星负载不均衡度。
 
-        负载计算方式：
-        - "task_count"：每颗卫星调度任务数量；
-        - "duration"：每颗卫星总观测时长。
+    if not satellite_ids:
+        raise ValueError("satellite_ids is empty")
 
-    """
-
-    # 初始化每颗卫星的负载
     loads = {sat_id: 0.0 for sat_id in satellite_ids}
 
-    # 统计每颗卫星的负载
     for node_id in solution:
+        if node_id not in nodes_by_id:
+            raise ValueError(f"Unknown node_id in solution: {node_id}")
+
         node = nodes_by_id[node_id]
 
-        if load_mode == "duration":
-            # 使用观测窗口时长作为负载
-            loads[node.sat_id] += node.duration
-        else:
-            # 默认使用任务数量作为负载
-            loads[node.sat_id] += 1.0
+        if node.sat_id not in loads:
+            raise ValueError(
+                f"Node {node_id} uses satellite {node.sat_id}, "
+                f"but satellite_ids={list(satellite_ids)}"
+            )
+
+        loads[node.sat_id] += node_load_amount(node, load_mode)
 
     values = list(loads.values())
-
-    if not values:
-        return 0.0
-
-    # 计算负载平均值
     mean_load = sum(values) / len(values)
 
-    # 返回负载标准差
     return math.sqrt(
         sum((value - mean_load) ** 2 for value in values) / len(values)
     )
-
 
 def is_feasible(
     solution: Iterable[int],
     conflict_adj: dict[int, set[int]],
 ) -> bool:
-    """判断调度方案是否满足冲突图约束。
-
-    参数
-    ----
-    solution:
-        调度方案，表示为被选中的 node_id 集合或列表。
-
-    conflict_adj:
-        冲突图邻接表。
-        conflict_adj[node_id] 表示与 node_id 冲突的所有节点集合。
-
-    返回
-    ----
-    bool:
-        True 表示方案可行；
-        False 表示方案中存在冲突节点。
-
-    如果一个方案中存在两个互相冲突的节点，
-    即二者在冲突图中有边相连，则该方案不可行。
-    """
 
     selected = set(solution)
 
@@ -246,23 +267,21 @@ def evaluate_solution(
 ) -> Tuple[float, float, float]:
     """计算调度方案的三目标函数值。
 
-        f1：未完成收益率，越小越好；
+        f1：总收益目标，内部为 -scheduled_profit，越小越好；
         f2：姿态机动代价，越小越好；
         f3：负载不均衡度，越小越好。
     """
+    solution = list(solution)
 
     # 合并默认参数和外部参数
     p = {**DEFAULT_MODEL_PARAMS, **(params or {})}
 
-    # 所有任务的总收益
-    total_profit = sum(task.profit for task in tasks.values())
-
     # 当前方案完成任务的收益
     scheduled_profit = calculate_profit(solution, nodes_by_id)
 
-    # 目标 1：未完成收益率
-    # 原始目标是最大化收益，这里转成最小化形式
-    f1 = 1.0 - scheduled_profit / total_profit if total_profit > 0 else 1.0
+    # 目标 1：总收益。
+    # 原始目标是最大化收益；算法框架统一最小化，因此内部使用负收益。
+    f1 = -scheduled_profit
 
     # 目标 2：姿态机动代价
     f2 = calculate_maneuver_cost(solution, nodes_by_id, p)
@@ -288,7 +307,7 @@ def task_completion_rate(
     任务完成率只统计任务数量，不考虑任务收益。
     它和 f1 不完全相同：
 
-        f1 关注收益完成情况；
+        f1 关注总收益；
         completion_rate 关注任务数量完成情况。
     """
 

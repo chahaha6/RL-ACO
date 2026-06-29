@@ -81,28 +81,6 @@ DEFAULT_PARAMS = {
 
 
 class SFMODBO:
-    """策略融合多目标蜣螂优化算法。
-
-    参数
-    ----
-    tasks:
-        任务字典，task_id -> Task。
-
-    nodes:
-        任务-卫星-窗口候选节点列表。
-
-    conflict_adj:
-        冲突图邻接表。
-        conflict_adj[node_id] 表示与 node_id 冲突的节点集合。
-
-    params:
-        SFMODBO 算法参数。
-        注意：这里不包含问题模型参数。
-
-    model_params:
-        与其他算法共用的问题模型参数，包括最小姿态转换时间、
-        姿态机动系数和负载计算方式。
-    """
 
     LOG_NAME = "SFMODBO"
 
@@ -657,8 +635,8 @@ class SFMODBO:
                 or iteration % max(1, max_iter // 10) == 0
                 or iteration == max_iter
             ):
-                best_f1 = min(
-                    (s.objectives[0] for s in self.archive),
+                best_f1 = max(
+                    (-s.objectives[0] for s in self.archive),
                     default=float("nan"),
                 )
 
@@ -687,7 +665,7 @@ class SFMODBO:
             writer.writerow(
                 [
                     "solution_index",
-                    "f1_uncompleted_profit_ratio",
+                    "f1_total_profit",
                     "f2_maneuver_cost",
                     "f3_load_imbalance",
                     "scheduled_nodes",
@@ -708,7 +686,7 @@ class SFMODBO:
                 writer.writerow(
                     [
                         idx,
-                        sol.objectives[0],
+                        -sol.objectives[0],
                         sol.objectives[1],
                         sol.objectives[2],
                         len(sol.node_ids),

@@ -16,11 +16,11 @@ from .utils import Solution, dominates, set_random_seed, update_archive
 
 DEFAULT_PARAMS = {
     "pop_size": 50,
-    "max_iter": 100,
+    "max_iter": 300,
     "archive_size": 100,
     "lower_bound": 0.0,
     "upper_bound": 1.0,
-    "crossover_probability": 0.90,
+    "crossover_probability": 0.80,
     "mutation_probability": None,
     "mutation_strength": 0.10,
     "tournament_size": 2,
@@ -261,7 +261,7 @@ class SPEA2:
                 or iteration % max(1, max_iter // 10) == 0
                 or iteration == max_iter
             ):
-                best_f1 = min((s.objectives[0] for s in self.archive), default=float("nan"))
+                best_f1 = max((-s.objectives[0] for s in self.archive), default=float("nan"))
                 print(
                     f"[SPEA2] Iter {iteration:>4}/{max_iter}: "
                     f"archive={len(self.archive):>3}, best_f1={best_f1:.4f}"
@@ -277,7 +277,7 @@ class SPEA2:
             writer = csv.writer(f)
             writer.writerow([
                 "solution_index",
-                "f1_uncompleted_profit_ratio",
+                "f1_total_profit",
                 "f2_maneuver_cost",
                 "f3_load_imbalance",
                 "scheduled_nodes",
@@ -290,7 +290,7 @@ class SPEA2:
                 scheduled_tasks = {self.nodes_by_id[nid].task_id for nid in sol.node_ids}
                 writer.writerow([
                     idx,
-                    sol.objectives[0],
+                    -sol.objectives[0],
                     sol.objectives[1],
                     sol.objectives[2],
                     len(sol.node_ids),
@@ -298,4 +298,3 @@ class SPEA2:
                     task_completion_rate(sol.node_ids, total_task_count, self.nodes_by_id),
                     " ".join(map(str, sorted(sol.node_ids))),
                 ])
-

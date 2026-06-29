@@ -10,7 +10,10 @@ from typing import Iterable
 
 
 OBJECTIVE_KEYS = ("f1", "f2", "f3")
-ARCHIVE_PATTERN = re.compile(r"(?P<tag>.+)_t(?P<tasks>\d+)_archive\.csv$", re.IGNORECASE)
+ARCHIVE_PATTERN = re.compile(
+    r"(?P<tag>.+?)_t(?P<tasks>\d+)(?:_.*?)?_(?:archive|per)\.csv$",
+    re.IGNORECASE,
+)
 
 
 def normalize_tag(raw_tag: str) -> str:
@@ -57,20 +60,37 @@ def read_archive_points(path: Path) -> list[dict]:
     points = []
     with path.open("r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
-        if not reader.fieldnames or not all(key in reader.fieldnames for key in OBJECTIVE_KEYS):
+        if not reader.fieldnames:
+            return []
+
+        has_f_objectives = all(key in reader.fieldnames for key in OBJECTIVE_KEYS)
+        has_named_objectives = all(
+            key in reader.fieldnames
+            for key in ("profit", "load", "attitude")
+        )
+        if not has_f_objectives and not has_named_objectives:
             return []
 
         for row in reader:
             try:
-                point = {
-                    "run": str(row.get("Run", "1")),
-                    "f1": float(row["f1"]),
-                    "f2": float(row["f2"]),
-                    "f3": float(row["f3"]),
-                    "node_ids": row.get("Node_ids", ""),
-                }
+                if has_f_objectives:
+                    f1 = float(row["f1"])
+                    f2 = float(row["f2"])
+                    f3 = float(row["f3"])
+                else:
+                    profit = float(row["profit"])
+                    f1 = -profit if profit < 0 else profit
+                    f2 = float(row["attitude"])
+                    f3 = float(row["load"])
             except (TypeError, ValueError):
                 continue
+            point = {
+                "run": str(row.get("Run", "1")),
+                "f1": f1,
+                "f2": f2,
+                "f3": f3,
+                "node_ids": row.get("Node_ids", ""),
+            }
             points.append(point)
     return points
 
@@ -83,7 +103,7 @@ def discover_archives(
     if not input_dir.exists():
         return archives
 
-    for path in sorted(input_dir.glob("**/*_archive.csv")):
+    for path in sorted(input_dir.glob("**/*.csv")):
         parsed = parse_archive_filename(path)
         if parsed is None:
             continue
@@ -126,11 +146,38 @@ def non_dominated(points: Iterable[tuple[float, float, float]]) -> list[tuple[fl
     return kept
 
 
+def metric_point(raw_point: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Convert displayed objectives to the minimization form used by HV/IGD."""
+
+    f1_profit, f2_maneuver, f3_load = raw_point
+    return (-f1_profit, f2_maneuver, f3_load)
+
+
+def metric_point_from_dict(point: dict) -> tuple[float, float, float]:
+    return metric_point((point["f1"], point["f2"], point["f3"]))
+
+
+def non_dominated_raw(points: Iterable[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+    """Non-dominated filtering for displayed points where f1 is total profit."""
+
+    unique = sorted(set(points))
+    kept = []
+    for i, point in enumerate(unique):
+        point_metric = metric_point(point)
+        if any(
+            i != j and dominates(metric_point(other), point_metric)
+            for j, other in enumerate(unique)
+        ):
+            continue
+        kept.append(point)
+    return kept
+
+
 def bounds_for_case(archives: list[dict]) -> tuple[tuple[float, ...], tuple[float, ...]]:
     values = []
     for archive in archives:
         for point in archive["points"]:
-            values.append((point["f1"], point["f2"], point["f3"]))
+            values.append(metric_point_from_dict(point))
     if not values:
         return (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
 
@@ -234,8 +281,8 @@ def metric_rows_for_archives(archives: list[dict]) -> list[dict]:
 
         all_norm_points = []
         for archive in case_archives:
-            raw_points = [(p["f1"], p["f2"], p["f3"]) for p in archive["points"]]
-            all_norm_points.extend(normalize_points(raw_points, ideal, nadir))
+            metric_points = [metric_point_from_dict(p) for p in archive["points"]]
+            all_norm_points.extend(normalize_points(metric_points, ideal, nadir))
         reference_front = non_dominated(all_norm_points)
 
         for archive in sorted(case_archives, key=lambda item: item["label"]):
@@ -252,12 +299,12 @@ def metric_rows_for_archives(archives: list[dict]) -> list[dict]:
             completion_values = []
 
             for run_id, run_points in sorted(by_run.items()):
-                raw_points = [(p["f1"], p["f2"], p["f3"]) for p in run_points]
-                norm_points = normalize_points(raw_points, ideal, nadir)
+                metric_points = [metric_point_from_dict(p) for p in run_points]
+                norm_points = normalize_points(metric_points, ideal, nadir)
                 hv_values.append(hypervolume_3d(norm_points))
                 igd_values.append(igd(norm_points, reference_front))
                 archive_sizes.append(float(len(run_points)))
-                best_f1_values.append(min(p["f1"] for p in run_points))
+                best_f1_values.append(max(p["f1"] for p in run_points))
                 best_f2_values.append(min(p["f2"] for p in run_points))
                 best_f3_values.append(min(p["f3"] for p in run_points))
                 if archive["task_count"] > 0:
@@ -314,11 +361,11 @@ def write_metrics_tex(rows: list[dict], output_file: Path, title: str) -> None:
         f"\\subsection*{{{tex_escape(title)}}}",
         "\\begin{longtable}{llrrrrr}",
         "\\toprule",
-        "Case & Algorithm & HV & IGD & Best $f_1$ & Best $f_2$ & Completion \\\\",
+        "Case & Algorithm & HV & IGD & Best profit & Best $f_2$ & Completion \\\\",
         "\\midrule",
         "\\endfirsthead",
         "\\toprule",
-        "Case & Algorithm & HV & IGD & Best $f_1$ & Best $f_2$ & Completion \\\\",
+        "Case & Algorithm & HV & IGD & Best profit & Best $f_2$ & Completion \\\\",
         "\\midrule",
         "\\endhead",
     ]
@@ -366,7 +413,7 @@ def collect_plot_points(archives: list[dict]) -> dict[str, dict[str, list[tuple[
     by_case: dict[str, dict[str, list[tuple[float, float, float]]]] = defaultdict(lambda: defaultdict(list))
     for archive in archives:
         points = [(p["f1"], p["f2"], p["f3"]) for p in archive["points"]]
-        by_case[archive["case"]][archive["label"]].extend(non_dominated(points))
+        by_case[archive["case"]][archive["label"]].extend(non_dominated_raw(points))
     return by_case
 
 
@@ -402,6 +449,16 @@ def generate_pareto_plots(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    plt.rcParams.update(
+        {
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Arial", "DejaVu Sans", "Liberation Sans"],
+            "svg.fonttype": "none",
+            "pdf.fonttype": 42,
+            "legend.frameon": False,
+        }
+    )
+
     search_dir = input_dir if input_dir is not None else (root / "results" if root is not None else None)
     if search_dir is None:
         raise ValueError("Either input_dir or root must be provided.")
@@ -410,11 +467,19 @@ def generate_pareto_plots(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     figure_files = []
+    algorithm_styles = {
+        "CG-MOACO": ("#0F4D92", "o"),
+        "MOACO": ("#3775BA", "s"),
+        "MODBO": ("#B64342", "^"),
+        "MOPSO": ("#42949E", "D"),
+        "SPEA2": ("#9A4D8E", "P"),
+        "NSGA-II": ("#767676", "X"),
+    }
     for case_name, by_algorithm in sorted(plot_data.items()):
-        fig = plt.figure(figsize=(8, 6))
+        fig = plt.figure(figsize=(7.2, 5.4))
         ax = fig.add_subplot(111, projection="3d")
         for label, points in sorted(by_algorithm.items()):
-            nd_points = non_dominated(points)
+            nd_points = non_dominated_raw(points)
             if len(nd_points) > 400:
                 step = max(1, len(nd_points) // 400)
                 nd_points = nd_points[::step]
@@ -423,17 +488,47 @@ def generate_pareto_plots(
             xs = [p[0] for p in nd_points]
             ys = [p[1] for p in nd_points]
             zs = [p[2] for p in nd_points]
-            ax.scatter(xs, ys, zs, s=12, alpha=0.75, label=label)
+            color, marker = algorithm_styles.get(label, (None, "o"))
+            ax.scatter(
+                xs,
+                ys,
+                zs,
+                s=14,
+                alpha=0.72,
+                color=color,
+                marker=marker,
+                label=label,
+                depthshade=False,
+            )
 
-        ax.set_xlabel("f1")
-        ax.set_ylabel("f2")
-        ax.set_zlabel("f3")
-        ax.set_title(f"{title}: {case_name}")
-        ax.legend(loc="best", fontsize=8)
-        fig.tight_layout()
+        ax.set_xlabel("Total profit", labelpad=6)
+        ax.set_ylabel("Maneuver cost", labelpad=7)
+        ax.set_zlabel("")
+        ax.text2D(
+            1.08,
+            0.53,
+            "Load imbalance",
+            transform=ax.transAxes,
+            rotation=90,
+            ha="center",
+            va="center",
+        )
+        ax.set_title(f"Pareto front: {case_name}", fontsize=10, pad=8)
+        ax.view_init(elev=24, azim=-55)
+        ax.tick_params(labelsize=7, pad=1)
+        ax.legend(
+            loc="upper left",
+            bbox_to_anchor=(0.01, 0.98),
+            fontsize=7,
+            markerscale=0.9,
+            borderaxespad=0,
+        )
+        fig.subplots_adjust(left=0.01, right=0.90, bottom=0.03, top=0.92)
 
         figure_file = output_dir / f"pareto_front_{case_name}.png"
         fig.savefig(figure_file, dpi=300, bbox_inches="tight")
+        fig.savefig(figure_file.with_suffix(".svg"), bbox_inches="tight")
+        fig.savefig(figure_file.with_suffix(".pdf"), bbox_inches="tight")
         plt.close(fig)
         figure_files.append(figure_file)
         print(f"Pareto figure saved to {figure_file}")

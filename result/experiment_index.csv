@@ -1,0 +1,11 @@
+﻿Case,Group,Algorithm,Tag,PerFile,AverageFile,ScheduleFile
+world_s5_t200,comparison,MODBO,modbo,F:\CGMOACO\result\world_s5_t200\modbo_t200_per.csv,F:\CGMOACO\result\world_s5_t200\modbo_t200_average.csv,F:\CGMOACO\result\world_s5_t200\modbo_t200_schedule.csv
+world_s5_t200,comparison,MOPSO,mopso,F:\CGMOACO\result\world_s5_t200\mopso_t200_per.csv,F:\CGMOACO\result\world_s5_t200\mopso_t200_average.csv,F:\CGMOACO\result\world_s5_t200\mopso_t200_schedule.csv
+world_s5_t400,comparison,MODBO,modbo,F:\CGMOACO\result\world_s5_t400\modbo_t400_per.csv,F:\CGMOACO\result\world_s5_t400\modbo_t400_average.csv,F:\CGMOACO\result\world_s5_t400\modbo_t400_schedule.csv
+world_s5_t400,comparison,MOPSO,mopso,F:\CGMOACO\result\world_s5_t400\mopso_t400_per.csv,F:\CGMOACO\result\world_s5_t400\mopso_t400_average.csv,F:\CGMOACO\result\world_s5_t400\mopso_t400_schedule.csv
+world_s5_t600,comparison,MODBO,modbo,F:\CGMOACO\result\world_s5_t600\modbo_t600_per.csv,F:\CGMOACO\result\world_s5_t600\modbo_t600_average.csv,F:\CGMOACO\result\world_s5_t600\modbo_t600_schedule.csv
+world_s5_t600,comparison,MOPSO,mopso,F:\CGMOACO\result\world_s5_t600\mopso_t600_per.csv,F:\CGMOACO\result\world_s5_t600\mopso_t600_average.csv,F:\CGMOACO\result\world_s5_t600\mopso_t600_schedule.csv
+world_s5_t800,comparison,MODBO,modbo,F:\CGMOACO\result\world_s5_t800\modbo_t800_per.csv,F:\CGMOACO\result\world_s5_t800\modbo_t800_average.csv,F:\CGMOACO\result\world_s5_t800\modbo_t800_schedule.csv
+world_s5_t800,comparison,MOPSO,mopso,F:\CGMOACO\result\world_s5_t800\mopso_t800_per.csv,F:\CGMOACO\result\world_s5_t800\mopso_t800_average.csv,F:\CGMOACO\result\world_s5_t800\mopso_t800_schedule.csv
+world_s5_t1000,comparison,MODBO,modbo,F:\CGMOACO\result\world_s5_t1000\modbo_t1000_per.csv,F:\CGMOACO\result\world_s5_t1000\modbo_t1000_average.csv,F:\CGMOACO\result\world_s5_t1000\modbo_t1000_schedule.csv
+world_s5_t1000,comparison,MOPSO,mopso,F:\CGMOACO\result\world_s5_t1000\mopso_t1000_per.csv,F:\CGMOACO\result\world_s5_t1000\mopso_t1000_average.csv,F:\CGMOACO\result\world_s5_t1000\mopso_t1000_schedule.csv

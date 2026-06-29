@@ -10,7 +10,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-
 @dataclass
 class ReplayTransition:
     state_action: list[float]
@@ -139,4 +138,3 @@ class DDQNAgent:
 
         self.last_loss = float(loss.item())
         return self.last_loss
-

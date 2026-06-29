@@ -35,31 +35,46 @@ from modules.spea2 import SPEA2, DEFAULT_PARAMS as SPEA2_DEFAULT_PARAMS
 from modules.conflict_graph import build_conflict_graph, compute_graph_features
 from modules.domain import CandidateNode, Task
 from modules.problem_model import DEFAULT_MODEL_PARAMS, task_completion_rate
-from modules.utils import Solution
+from modules.utils import Solution, format_seconds
 
 
 # =========================================================
 # 数据集选择：按“卫星数、任务数”选择问题
 # 只跑一个数据集就写成 [(5, 100)]。
 # =========================================================
-DEFAULT_DATASET_PREFIX = "area"
 
+DEFAULT_DATASET_PREFIX = "area"
 CASE_LIST = [
     (5, 100),
-    # (5, 300),
-    # (5, 500),
-    # (5, 1000),
+    (5, 200),
+    (5, 300),
+    (5, 400),
+    (5, 500),
+    (5, 600),
+    (5, 700),
+    (5, 800),
+    (5, 900),
+    (5, 1000),
 ]
+
+# DEFAULT_DATASET_PREFIX = "world"
+# CASE_LIST = [
+#     (5, 200),
+#     (5, 400),
+#     (5, 600),
+#     (5, 800),
+#     (5, 1000),
+# ]
 
 # ---------- 对比实验 ----------
 RUN_COMPARISON_EXPERIMENTS = True
 
-RUN_RL_CG_MOACO = True
+RUN_RL_CG_MOACO = False
 RUN_CG_MOACO = False
 RUN_MODBO = False
 RUN_MOPSO = False
 RUN_SPEA2 = False
-RUN_MOACO = False
+RUN_MOACO = True
 RUN_NSGA2 = False
 
 # ---------- 消融实验 ----------
@@ -79,9 +94,10 @@ RUN_PARAMETER_ANALYSIS = False
 #   ITERATION_COUNT：每轮迭代代数
 # =========================================================
 RUN_COUNT = 10
-ITERATION_COUNT = 100
+ITERATION_COUNT = 300
 POP_SIZE = 50
 ARCHIVE_SIZE = 100
+
 RANDOM_SEED_BASE = 2026
 VERBOSE = True
 
@@ -94,12 +110,12 @@ MODEL_PARAMS = {
 # =========================================================
 # 结果保存设置
 # =========================================================
-RESULTS_ROOT = "results"
+RESULTS_ROOT = "result"
 CSV_DATA_ROOT = Path(__file__).resolve().parent / "CSV_DATA"
 
-# True：同名 summary/archive CSV 会被覆盖。
-# False：如果结果 CSV 已存在，则跳过该实验。
-OVERWRITE_RESULT_CSV = True
+# True：清空同名结果，从第 1 轮重新运行。
+# False：完整结果直接跳过；部分结果只补跑缺少的轮次。
+OVERWRITE_RESULT_CSV = False
 
 
 # =========================================================
@@ -121,6 +137,12 @@ CG_EXTRA_PARAMS = {
     "lambda_maneuver": 1.0,
     "lambda_load": 1.0,
 
+    # ---------- 候选受限构造参数 ----------
+    # candidate_pool_size：每一步最多进入概率选择的候选节点数；<=0 表示不限制
+    # candidate_random_ratio：候选池中随机探索节点比例，防止过早收敛
+    "candidate_pool_size": 300,
+    "candidate_random_ratio": 0.15,
+
     # ---------- 局部搜索开关 ----------
     # enable_local_search：是否启用冲突图感知局部搜索
     # enable_fast_insert：是否启用快速插入操作
@@ -128,6 +150,11 @@ CG_EXTRA_PARAMS = {
     "enable_local_search": True,
     "enable_fast_insert": True,
     "enable_replacement": True,
+
+    # local_search_candidate_limit：快速插入阶段最多排序/检查的候选节点数；<=0 表示不限制
+    # replacement_candidate_limit：替换阶段最多排序/检查的候选节点数；<=0 表示不限制
+    "local_search_candidate_limit": 500,
+    "replacement_candidate_limit": 300,
 
     # ---------- 信息素更新开关 ----------
     # use_graph_pheromone：是否使用冲突图贡献度引导信息素更新
@@ -148,6 +175,27 @@ CG_EXTRA_PARAMS = {
     "w_profit": 1.0,
     "w_maneuver": 0.01,
     "w_load": 1.0,
+
+    # ---------- 可行性验证 ----------
+    # 默认跳过每只蚂蚁的全量验证，每 20 代抽查并在返回前验证最终档案。
+    "validate_each_solution": False,
+    "validate_interval": 20,
+    "validate_final_archive": True,
+}
+
+
+# =========================================================
+# MOACO 基线候选池参数
+#
+# 为了让普通 MOACO 在大规模数据上也能跑得动，这里只使用 MOACO 自己的
+# simple_heuristic 构造候选池，不使用冲突图贡献度。
+# =========================================================
+MOACO_EXTRA_PARAMS = {
+    "candidate_pool_size": 200,
+    "candidate_random_ratio": 0.1,
+    "validate_each_solution": False,
+    "validate_interval": 20,
+    "validate_final_archive": True,
 }
 
 
@@ -188,6 +236,16 @@ class ExperimentSpec:
     group: str
 
 
+@dataclass
+class RunResult:
+    """单轮实验的计算结果。"""
+
+    run_idx: int
+    average_row: dict
+    per_rows: list[dict]
+    schedule_rows: list[dict]
+
+
 def dataset_name(
     satellite_count: int,
     task_count: int,
@@ -200,6 +258,16 @@ def dataset_name(
     if task_count <= 0:
         raise ValueError("task_count must be positive")
     return f"{prefix}_s{satellite_count}_t{task_count}"
+
+
+def result_case_name(
+    satellite_count: int,
+    task_count: int,
+    prefix: str = DEFAULT_DATASET_PREFIX,
+) -> str:
+    """生成 result/world_s5_t100 这种带数据集前缀的结果目录名。"""
+
+    return dataset_name(satellite_count, task_count, prefix)
 
 
 def read_tasks_csv(file_path: str | Path) -> dict[int, Task]:
@@ -231,6 +299,12 @@ def read_candidate_nodes_csv(file_path: str | Path) -> list[CandidateNode]:
     if not path.is_file():
         raise FileNotFoundError(f"Missing preprocessed candidate file: {path}")
 
+    def optional_float(row: dict, key: str) -> float | None:
+        value = row.get(key)
+        if value is None or value == "":
+            return None
+        return float(value)
+
     nodes: list[CandidateNode] = []
     with path.open("r", newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -246,6 +320,12 @@ def read_candidate_nodes_csv(file_path: str | Path) -> list[CandidateNode]:
                 task_duration=float(row["task_duration"]),
                 coord_1=float(row["coord_1"]),
                 coord_2=float(row["coord_2"]),
+                roll=optional_float(row, "roll"),
+                pitch=optional_float(row, "pitch"),
+                yaw=optional_float(row, "yaw"),
+                end_roll=optional_float(row, "end_roll"),
+                end_pitch=optional_float(row, "end_pitch"),
+                end_yaw=optional_float(row, "end_yaw"),
             )
             if node.duration + 1e-9 < node.task_duration:
                 raise ValueError(
@@ -284,13 +364,125 @@ def result_file_stem(algo_tag: str, task_count: int) -> str:
     return f"{algo_tag}_t{task_count}"
 
 
-def result_files(results_dir: Path, algo_tag: str, task_count: int) -> tuple[Path, Path]:
-    """返回某算法某数据集的 summary 文件和 Pareto 档案文件。"""
+def result_files(results_dir: Path, algo_tag: str, task_count: int) -> tuple[Path, Path, Path]:
+    """返回某算法某数据集的 per、average 和 schedule 文件。"""
 
     stem = result_file_stem(algo_tag, task_count)
-    summary_file = results_dir / f"{stem}_summary.csv"
-    archive_file = results_dir / f"{stem}_archive.csv"
-    return summary_file, archive_file
+    per_file = results_dir / f"{stem}_per.csv"
+    average_file = results_dir / f"{stem}_average.csv"
+    schedule_file = results_dir / f"{stem}_schedule.csv"
+    return per_file, average_file, schedule_file
+
+
+PER_FIELDNAMES = [
+    "Run",
+    "Index",
+    "profit",
+    "load",
+    "attitude",
+    "quality",
+    "Node_ids",
+]
+
+AVERAGE_FIELDNAMES = [
+    "Run",
+    "ExperimentGroup",
+    "Algorithm",
+    "Tag",
+    "Case",
+    "Param_Set",
+    "Archive_size",
+    "Profit_max",
+    "Load_min",
+    "Attitude_min",
+    "Quality_max",
+    "Representative_Profit",
+    "Representative_Load",
+    "Representative_Attitude",
+    "Representative_Quality",
+    "Task_count_mean",
+    "Representative_Index",
+    "Final_feasible_count",
+    "Final_candidate_count",
+    "Best_completion_rate",
+    "Runtime_seconds",
+    "RL_T_ref",
+    "RL_avg_episode_length",
+    "RL_last_train_loss",
+    "RL_last_epsilon",
+    "RL_last_kappa",
+    "RL_last_q_baseline",
+    "RL_last_advantage_span",
+    "RL_replay_size",
+    "Candidate_nodes",
+    "Conflict_edges",
+    "Param_overrides",
+]
+
+AVERAGE_NUMERIC_KEYS = [
+    "Archive_size",
+    "Profit_max",
+    "Load_min",
+    "Attitude_min",
+    "Quality_max",
+    "Representative_Profit",
+    "Representative_Load",
+    "Representative_Attitude",
+    "Representative_Quality",
+    "Task_count_mean",
+    "Final_feasible_count",
+    "Final_candidate_count",
+    "Best_completion_rate",
+    "Runtime_seconds",
+    "RL_T_ref",
+    "RL_avg_episode_length",
+    "RL_last_train_loss",
+    "RL_last_epsilon",
+    "RL_last_kappa",
+    "RL_last_q_baseline",
+    "RL_last_advantage_span",
+    "RL_replay_size",
+    "Candidate_nodes",
+    "Conflict_edges",
+]
+
+SCHEDULE_FIELDNAMES = [
+    "Run",
+    "Representative_Index",
+    "Task_Count",
+    "Profit",
+    "Load",
+    "Attitude",
+    "Quality",
+    "Task_Order",
+    "Task_ID",
+    "Window_Index",
+    "Satellite_Index",
+    "Actual_Start",
+    "Actual_End",
+    "Duration_Seconds",
+]
+
+
+def read_csv_rows(file_path: Path) -> list[dict]:
+    """读取已有结果；文件不存在或为空时返回空列表。"""
+
+    if not file_path.is_file() or file_path.stat().st_size == 0:
+        return []
+    with file_path.open("r", newline="", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
+def write_csv_atomic(file_path: Path, fieldnames: list[str], rows: list[dict]) -> None:
+    """先写临时文件再替换目标文件，避免中断留下半个 CSV。"""
+
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = file_path.with_suffix(file_path.suffix + ".tmp")
+    with temp_file.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    temp_file.replace(file_path)
 
 
 def safe_mean(values: list[float]) -> float | str:
@@ -379,7 +571,7 @@ def summarize_archive(
             "best_completion_rate": "",
         }
 
-    best_f1 = min(sol.objectives[0] for sol in archive)
+    best_f1 = max(-sol.objectives[0] for sol in archive)
     best_f2 = min(sol.objectives[1] for sol in archive)
     best_f3 = min(sol.objectives[2] for sol in archive)
 
@@ -395,6 +587,74 @@ def summarize_archive(
         "best_f3": best_f3,
         "best_completion_rate": best_completion_rate,
     }
+
+
+def solution_result_metrics(sol: Solution) -> dict:
+    """把内部目标转成结果 CSV 使用的正向指标。"""
+
+    return {
+        "profit": -sol.objectives[0],
+        "attitude": sol.objectives[1],
+        "load": sol.objectives[2],
+        "quality": "",
+    }
+
+
+def select_representative_solution(archive: list[Solution]) -> tuple[int | str, Solution | None]:
+    """选择每轮写入 schedule 的代表解。默认取总收益最高的解。"""
+
+    if not archive:
+        return "", None
+    best_idx, best_sol = max(
+        enumerate(archive),
+        key=lambda item: -item[1].objectives[0],
+    )
+    return best_idx, best_sol
+
+
+def seconds_to_result_time(seconds: float) -> str:
+    """将秒数写成结果表中稳定可读的时间字符串。"""
+
+    return f"2013-04-20T{format_seconds(seconds)}"
+
+
+def schedule_rows_for_solution(
+    *,
+    run_idx: int,
+    representative_index: int | str,
+    sol: Solution,
+    nodes_by_id: dict[int, CandidateNode],
+) -> list[dict]:
+    metrics = solution_result_metrics(sol)
+    ordered_nodes = sorted(
+        (nodes_by_id[node_id] for node_id in sol.node_ids),
+        key=lambda node: (node.start, node.sat_id, node.task_id, node.window_id),
+    )
+    task_count = len({node.task_id for node in ordered_nodes})
+
+    rows = []
+    for order, node in enumerate(ordered_nodes, start=1):
+        actual_start = node.start
+        actual_end = node.start + node.task_duration
+        rows.append(
+            {
+                "Run": run_idx,
+                "Representative_Index": representative_index,
+                "Task_Count": task_count,
+                "Profit": metrics["profit"],
+                "Load": metrics["load"],
+                "Attitude": metrics["attitude"],
+                "Quality": metrics["quality"],
+                "Task_Order": order,
+                "Task_ID": node.task_id,
+                "Window_Index": node.window_id,
+                "Satellite_Index": node.sat_id,
+                "Actual_Start": seconds_to_result_time(actual_start),
+                "Actual_End": seconds_to_result_time(actual_end),
+                "Duration_Seconds": node.task_duration,
+            }
+        )
+    return rows
 
 
 def enabled_experiments() -> list[ExperimentSpec]:
@@ -640,6 +900,7 @@ def build_algorithm(spec: ExperimentSpec, problem: dict, run_idx: int):
     if spec.algorithm_key == "moaco":
         params = {
             **MOACO_DEFAULT_PARAMS,
+            **MOACO_EXTRA_PARAMS,
             **model_params,
             **common_params,
             "num_ants": POP_SIZE,
@@ -720,6 +981,151 @@ def build_algorithm(spec: ExperimentSpec, problem: dict, run_idx: int):
     raise ValueError(f"Unsupported algorithm key: {spec.algorithm_key}")
 
 
+def run_single_round(
+    spec: ExperimentSpec,
+    problem: dict,
+    run_idx: int,
+    nodes_by_id: dict[int, CandidateNode],
+) -> RunResult:
+    """计算一轮独立实验。"""
+
+    print(f"\n========== {spec.name} Run {run_idx}/{RUN_COUNT} ==========")
+
+    solver = build_algorithm(spec, problem, run_idx)
+    archive = solver.run()
+    tasks = problem["tasks"]
+    nodes = problem["nodes"]
+    conflict_adj = problem["conflict_adj"]
+
+    summary = summarize_archive(
+        archive,
+        nodes_by_id,
+        total_task_count=len(tasks),
+    )
+
+    runtime = getattr(solver, "runtime_seconds", "")
+    rl_stats = getattr(solver, "rl_stats", {})
+    representative_index, representative_sol = select_representative_solution(archive)
+
+    if representative_sol is None:
+        representative_metrics = {
+            "profit": "",
+            "load": "",
+            "attitude": "",
+            "quality": "",
+        }
+        representative_task_count = ""
+    else:
+        representative_metrics = solution_result_metrics(representative_sol)
+        representative_task_count = len(
+            {nodes_by_id[node_id].task_id for node_id in representative_sol.node_ids}
+        )
+
+    average_row = {
+        "Run": run_idx,
+        "ExperimentGroup": spec.group,
+        "Algorithm": spec.name,
+        "Tag": spec.tag,
+        "Case": problem["case_name"],
+        "Param_Set": spec.tag,
+        "Archive_size": summary["archive_size"],
+        "Profit_max": summary["best_f1"],
+        "Load_min": summary["best_f3"],
+        "Attitude_min": summary["best_f2"],
+        "Quality_max": "",
+        "Representative_Profit": representative_metrics["profit"],
+        "Representative_Load": representative_metrics["load"],
+        "Representative_Attitude": representative_metrics["attitude"],
+        "Representative_Quality": representative_metrics["quality"],
+        "Task_count_mean": representative_task_count,
+        "Representative_Index": representative_index,
+        "Final_feasible_count": len(archive),
+        "Final_candidate_count": len(archive),
+        "Best_completion_rate": summary["best_completion_rate"],
+        "Runtime_seconds": runtime,
+        "RL_T_ref": rl_stats.get("t_ref", ""),
+        "RL_avg_episode_length": rl_stats.get("avg_episode_length", ""),
+        "RL_last_train_loss": rl_stats.get("last_train_loss", ""),
+        "RL_last_epsilon": rl_stats.get("last_epsilon", ""),
+        "RL_last_kappa": rl_stats.get("last_kappa", ""),
+        "RL_last_q_baseline": rl_stats.get("last_q_baseline", ""),
+        "RL_last_advantage_span": rl_stats.get("last_advantage_span", ""),
+        "RL_replay_size": rl_stats.get("replay_size", ""),
+        "Candidate_nodes": len(nodes),
+        "Conflict_edges": sum(len(v) for v in conflict_adj.values()) // 2,
+        "Param_overrides": repr(spec.param_overrides),
+    }
+
+    per_rows = []
+    for sol_idx, sol in enumerate(archive):
+        metrics = solution_result_metrics(sol)
+        per_rows.append(
+            {
+                "Run": run_idx,
+                "Index": sol_idx,
+                "profit": metrics["profit"],
+                "load": metrics["load"],
+                "attitude": metrics["attitude"],
+                "quality": metrics["quality"],
+                "Node_ids": " ".join(str(node_id) for node_id in sorted(sol.node_ids)),
+            }
+        )
+
+    schedule_rows = []
+    if representative_sol is not None:
+        schedule_rows = schedule_rows_for_solution(
+            run_idx=run_idx,
+            representative_index=representative_index,
+            sol=representative_sol,
+            nodes_by_id=nodes_by_id,
+        )
+
+    print(
+        f"Run {run_idx} best: "
+        f"archive={summary['archive_size']}, "
+        f"best_f1={summary['best_f1']}, "
+        f"best_f2={summary['best_f2']}, "
+        f"best_f3={summary['best_f3']}, "
+        f"completion={summary['best_completion_rate']}"
+    )
+
+    return RunResult(
+        run_idx=run_idx,
+        average_row=average_row,
+        per_rows=per_rows,
+        schedule_rows=schedule_rows,
+    )
+
+
+def _run_sort_key(row: dict) -> tuple[int, int]:
+    value = row.get("Run", "")
+    try:
+        return 0, int(value)
+    except (TypeError, ValueError):
+        return 1, 0 if value == "Average" else 1
+
+
+def save_incremental_results(
+    per_file: Path,
+    average_file: Path,
+    schedule_file: Path,
+    average_rows: list[dict],
+    per_rows: list[dict],
+    schedule_rows: list[dict],
+) -> None:
+    """按轮次排序并原子保存当前已经完成的所有结果。"""
+
+    average_rows.sort(key=_run_sort_key)
+    per_rows.sort(key=lambda row: (int(row["Run"]), int(row["Index"])))
+    schedule_rows.sort(
+        key=lambda row: (int(row["Run"]), int(row["Task_Order"]))
+    )
+    # average 文件最后写，作为这一轮三个文件都已落盘的完成标记。
+    write_csv_atomic(per_file, PER_FIELDNAMES, per_rows)
+    write_csv_atomic(schedule_file, SCHEDULE_FIELDNAMES, schedule_rows)
+    write_csv_atomic(average_file, AVERAGE_FIELDNAMES, average_rows)
+
+
 def run_one_experiment(
     spec: ExperimentSpec,
     problem: dict,
@@ -727,130 +1133,108 @@ def run_one_experiment(
 ) -> dict:
     """在一个数据集上运行某个实验 RUN_COUNT 次。"""
 
-    summary_file, archive_file = result_files(
+    per_file, average_file, schedule_file = result_files(
         results_dir,
         spec.tag,
         problem["task_count"],
     )
-
-    if (
-        not OVERWRITE_RESULT_CSV
-        and summary_file.exists()
-        and archive_file.exists()
-    ):
-        print(f"\nSkip existing result: {summary_file}")
-        return {
-            "Group": spec.group,
-            "Algorithm": spec.name,
-            "Tag": spec.tag,
-            "SummaryFile": str(summary_file),
-            "ArchiveFile": str(archive_file),
-        }
 
     print(f"\nRunning experiment: {spec.name}")
     print(f"Group: {spec.group}")
     print(f"Budget: {budget_label()}")
 
     nodes = problem["nodes"]
-    tasks = problem["tasks"]
-    conflict_adj = problem["conflict_adj"]
     nodes_by_id = {node.node_id: node for node in nodes}
 
-    run_rows = []
-    archive_rows = []
+    if OVERWRITE_RESULT_CSV:
+        average_rows: list[dict] = []
+        per_rows: list[dict] = []
+        schedule_rows: list[dict] = []
+    else:
+        average_rows = [
+            row
+            for row in read_csv_rows(average_file)
+            if str(row.get("Run", "")).isdigit()
+        ]
+        per_rows = read_csv_rows(per_file)
+        schedule_rows = read_csv_rows(schedule_file)
 
-    for run_idx in range(1, RUN_COUNT + 1):
-        print(f"\n========== {spec.name} Run {run_idx}/{RUN_COUNT} ==========")
+    completed_runs = {int(row["Run"]) for row in average_rows}
+    all_runs = set(range(1, RUN_COUNT + 1))
+    existing_average_rows = read_csv_rows(average_file) if average_file.exists() else []
+    has_final_statistics = {row.get("Run") for row in existing_average_rows} >= {
+        "Average",
+        "Std",
+    }
 
-        solver = build_algorithm(spec, problem, run_idx)
-        archive = solver.run()
-
-        summary = summarize_archive(
-            archive,
-            nodes_by_id,
-            total_task_count=len(tasks),
-        )
-
-        runtime = getattr(solver, "runtime_seconds", "")
-        rl_stats = getattr(solver, "rl_stats", {})
-
-        run_row = {
-            "Run": run_idx,
-            "ExperimentGroup": spec.group,
+    if (
+        not OVERWRITE_RESULT_CSV
+        and completed_runs >= all_runs
+        and has_final_statistics
+        and per_file.exists()
+        and schedule_file.exists()
+    ):
+        print(f"\nSkip completed result: {average_file}")
+        return {
+            "Group": spec.group,
             "Algorithm": spec.name,
             "Tag": spec.tag,
-            "Case": problem["case_name"],
-            "Archive_size": summary["archive_size"],
-            "Best_f1": summary["best_f1"],
-            "Best_f2": summary["best_f2"],
-            "Best_f3": summary["best_f3"],
-            "Best_completion_rate": summary["best_completion_rate"],
-            "Runtime_seconds": runtime,
-            "RL_T_ref": rl_stats.get("t_ref", ""),
-            "RL_avg_episode_length": rl_stats.get("avg_episode_length", ""),
-            "RL_last_train_loss": rl_stats.get("last_train_loss", ""),
-            "RL_last_epsilon": rl_stats.get("last_epsilon", ""),
-            "RL_last_kappa": rl_stats.get("last_kappa", ""),
-            "RL_last_q_baseline": rl_stats.get("last_q_baseline", ""),
-            "RL_last_advantage_span": rl_stats.get("last_advantage_span", ""),
-            "RL_replay_size": rl_stats.get("replay_size", ""),
-            "Candidate_nodes": len(nodes),
-            "Conflict_edges": sum(len(v) for v in conflict_adj.values()) // 2,
-            "Param_overrides": repr(spec.param_overrides),
+            "PerFile": str(per_file),
+            "AverageFile": str(average_file),
+            "ScheduleFile": str(schedule_file),
         }
-        run_rows.append(run_row)
 
-        print(
-            f"Run {run_idx} best: "
-            f"archive={summary['archive_size']}, "
-            f"best_f1={summary['best_f1']}, "
-            f"best_f2={summary['best_f2']}, "
-            f"best_f3={summary['best_f3']}, "
-            f"completion={summary['best_completion_rate']}"
+    pending_runs = sorted(all_runs - completed_runs)
+    print(
+        f"Independent runs: completed={len(completed_runs)}, "
+        f"pending={len(pending_runs)}"
+    )
+
+    # 覆盖模式先清空旧文件；之后每完成一轮便立即原子更新三个 CSV。
+    if OVERWRITE_RESULT_CSV:
+        save_incremental_results(
+            per_file,
+            average_file,
+            schedule_file,
+            average_rows,
+            per_rows,
+            schedule_rows,
         )
 
-        for sol_idx, sol in enumerate(archive):
-            archive_rows.append(
-                {
-                    "Run": run_idx,
-                    "ExperimentGroup": spec.group,
-                    "Algorithm": spec.name,
-                    "Tag": spec.tag,
-                    "Case": problem["case_name"],
-                    "Index": sol_idx,
-                    "f1": sol.objectives[0],
-                    "f2": sol.objectives[1],
-                    "f3": sol.objectives[2],
-                    "Node_ids": " ".join(str(node_id) for node_id in sorted(sol.node_ids)),
-                }
-            )
+    for run_idx in pending_runs:
+        result = run_single_round(spec, problem, run_idx, nodes_by_id)
 
-    # 添加 Average 和 Std 行
-    numeric_keys = [
-        "Archive_size",
-        "Best_f1",
-        "Best_f2",
-        "Best_f3",
-        "Best_completion_rate",
-        "Runtime_seconds",
-        "RL_T_ref",
-        "RL_avg_episode_length",
-        "RL_last_train_loss",
-        "RL_last_epsilon",
-        "RL_last_kappa",
-        "RL_last_q_baseline",
-        "RL_last_advantage_span",
-        "RL_replay_size",
-        "Candidate_nodes",
-        "Conflict_edges",
-    ]
+        # 若恢复文件里残留了未完成轮次的数据，先替换该轮，避免重复。
+        average_rows = [row for row in average_rows if int(row["Run"]) != run_idx]
+        per_rows = [row for row in per_rows if int(row["Run"]) != run_idx]
+        schedule_rows = [row for row in schedule_rows if int(row["Run"]) != run_idx]
 
+        average_rows.append(result.average_row)
+        per_rows.extend(result.per_rows)
+        schedule_rows.extend(result.schedule_rows)
+        save_incremental_results(
+            per_file,
+            average_file,
+            schedule_file,
+            average_rows,
+            per_rows,
+            schedule_rows,
+        )
+        print(
+            f"Run {run_idx} saved immediately "
+            f"({len(average_rows)}/{RUN_COUNT} completed)."
+        )
+
+    # 所有轮次完成后再追加 Average 和 Std 行。
+    average_rows.sort(key=_run_sort_key)
     average_row = {
         "Run": "Average",
         "ExperimentGroup": spec.group,
         "Algorithm": spec.name,
         "Tag": spec.tag,
         "Case": problem["case_name"],
+        "Param_Set": spec.tag,
+        "Representative_Index": "",
         "Param_overrides": repr(spec.param_overrides),
     }
 
@@ -860,76 +1244,38 @@ def run_one_experiment(
         "Algorithm": spec.name,
         "Tag": spec.tag,
         "Case": problem["case_name"],
+        "Param_Set": spec.tag,
+        "Representative_Index": "",
         "Param_overrides": repr(spec.param_overrides),
     }
 
-    for key in numeric_keys:
-        values = [row[key] for row in run_rows]
+    for key in AVERAGE_NUMERIC_KEYS:
+        values = [row[key] for row in average_rows]
         average_row[key] = safe_mean(values)
         std_row[key] = safe_std(values)
 
-    run_rows.append(average_row)
-    run_rows.append(std_row)
+    average_rows.append(average_row)
+    average_rows.append(std_row)
+    save_incremental_results(
+        per_file,
+        average_file,
+        schedule_file,
+        average_rows,
+        per_rows,
+        schedule_rows,
+    )
 
-    # 保存每轮 summary
-    summary_file.parent.mkdir(parents=True, exist_ok=True)
-
-    with summary_file.open("w", newline="", encoding="utf-8-sig") as f:
-        fieldnames = [
-            "Run",
-            "ExperimentGroup",
-            "Algorithm",
-            "Tag",
-            "Case",
-            "Archive_size",
-            "Best_f1",
-            "Best_f2",
-            "Best_f3",
-            "Best_completion_rate",
-            "Runtime_seconds",
-            "RL_T_ref",
-            "RL_avg_episode_length",
-            "RL_last_train_loss",
-            "RL_last_epsilon",
-            "RL_last_kappa",
-            "RL_last_q_baseline",
-            "RL_last_advantage_span",
-            "RL_replay_size",
-            "Candidate_nodes",
-            "Conflict_edges",
-            "Param_overrides",
-        ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(run_rows)
-
-    # 保存每轮 Pareto 档案
-    with archive_file.open("w", newline="", encoding="utf-8-sig") as f:
-        fieldnames = [
-            "Run",
-            "ExperimentGroup",
-            "Algorithm",
-            "Tag",
-            "Case",
-            "Index",
-            "f1",
-            "f2",
-            "f3",
-            "Node_ids",
-        ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(archive_rows)
-
-    print(f"\nSummary saved to {summary_file}")
-    print(f"Archive saved to {archive_file}")
+    print(f"\nPer-run Pareto points saved to {per_file}")
+    print(f"Average summary saved to {average_file}")
+    print(f"Representative schedules saved to {schedule_file}")
 
     return {
         "Group": spec.group,
         "Algorithm": spec.name,
         "Tag": spec.tag,
-        "SummaryFile": str(summary_file),
-        "ArchiveFile": str(archive_file),
+        "PerFile": str(per_file),
+        "AverageFile": str(average_file),
+        "ScheduleFile": str(schedule_file),
     }
 
 
@@ -947,7 +1293,11 @@ def run_case(
         DEFAULT_DATASET_PREFIX,
     )
 
-    output_dir = base_dir / RESULTS_ROOT / case_name
+    output_dir = base_dir / RESULTS_ROOT / result_case_name(
+        satellite_count,
+        task_count,
+        DEFAULT_DATASET_PREFIX,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n========== CASE {case_name} ==========")
@@ -986,8 +1336,9 @@ def save_experiment_index(base_dir: Path, rows: list[dict]) -> None:
         "Group",
         "Algorithm",
         "Tag",
-        "SummaryFile",
-        "ArchiveFile",
+        "PerFile",
+        "AverageFile",
+        "ScheduleFile",
     ]
 
     with index_file.open("w", newline="", encoding="utf-8-sig") as f:
@@ -1051,7 +1402,11 @@ def main() -> None:
         for row in case_outputs:
             index_rows.append(
                 {
-                    "Case": dataset_name(satellite_count, task_count),
+                    "Case": result_case_name(
+                        satellite_count,
+                        task_count,
+                        DEFAULT_DATASET_PREFIX,
+                    ),
                     **row,
                 }
             )

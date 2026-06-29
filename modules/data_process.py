@@ -14,12 +14,20 @@ except ImportError:
     from domain import CandidateNode, Task
     from utils import parse_time_to_seconds
 
-DEFAULT_DATASET_PREFIX = "area"
+DEFAULT_DATASET_PREFIX = "world"
 SATELLITE_COUNT = 5
-TASK_COUNT = 500
+TASK_COUNT = 1000
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_DATA_ROOT = PROJECT_ROOT / "Local_Data"
 CSV_DATA_ROOT = PROJECT_ROOT / "CSV_DATA"
+
+
+@dataclass(frozen=True)
+class AttitudeSample:
+    time: float
+    roll: float
+    pitch: float
+    yaw: float
 
 
 @dataclass(frozen=True)
@@ -30,6 +38,7 @@ class TimeWindow:
     start: float
     end: float
     duration: float
+    attitude_samples: tuple[AttitudeSample, ...] = ()
 
 
 def dataset_name(satellite_count: int, task_count: int, prefix: str = DEFAULT_DATASET_PREFIX) -> str:
@@ -103,6 +112,8 @@ def read_tasklist(file_path: str | Path) -> Dict[int, Task]:
             if not line:
                 continue
             parts = line.split()
+            if _is_tasklist_metadata_line(parts):
+                continue
             if len(parts) < 6:
                 raise ValueError(f"Invalid task line {line_no}: {raw!r}")
             task_id = int(parts[0])
@@ -115,6 +126,21 @@ def read_tasklist(file_path: str | Path) -> Dict[int, Task]:
                 profit=float(parts[5]),
             )
     return tasks
+
+
+def _is_tasklist_metadata_line(parts: list[str]) -> bool:
+
+    if len(parts) != 4:
+        return False
+    try:
+        return (
+            int(float(parts[0])) == 2
+            and abs(float(parts[1]) - 45.0) < 1e-9
+            and abs(float(parts[2]) - 45.0) < 1e-9
+            and abs(float(parts[3])) < 1e-9
+        )
+    except ValueError:
+        return False
 
 
 def _is_int_line(line: str) -> bool:
@@ -167,6 +193,99 @@ def read_timewindow_file(file_path: str | Path) -> List[TimeWindow]:
     return windows
 
 
+def read_attitude_file(file_path: str | Path) -> list[tuple[AttitudeSample, ...]]:
+    """Read one outputattitude_*.txt file as window-aligned attitude blocks.
+
+    Each non-empty row has:
+    yyyy mm dd HH MM SS roll pitch yaw ...
+
+    Only roll and pitch are used by the transition-time formula, but yaw is
+    kept in the CSV for traceability.
+    """
+
+    path = Path(file_path)
+    blocks: list[tuple[AttitudeSample, ...]] = []
+    current: list[AttitudeSample] = []
+
+    def flush_current() -> None:
+        nonlocal current
+        if current:
+            blocks.append(tuple(current))
+            current = []
+
+    with path.open("r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                flush_current()
+                continue
+
+            parts = line.split()
+            if len(parts) < 9:
+                continue
+
+            current.append(
+                AttitudeSample(
+                    time=parse_time_to_seconds(parts[0:6]),
+                    roll=float(parts[6]),
+                    pitch=float(parts[7]),
+                    yaw=float(parts[8]),
+                )
+            )
+
+    flush_current()
+    return blocks
+
+
+def attach_attitudes_to_windows(
+    windows: list[TimeWindow],
+    attitude_blocks: list[tuple[AttitudeSample, ...]],
+) -> list[TimeWindow]:
+    """Attach attitude blocks to the corresponding visibility windows."""
+
+    if not attitude_blocks:
+        return windows
+
+    if len(windows) == len(attitude_blocks):
+        return [
+            TimeWindow(
+                task_id=window.task_id,
+                sat_id=window.sat_id,
+                window_id=window.window_id,
+                start=window.start,
+                end=window.end,
+                duration=window.duration,
+                attitude_samples=block,
+            )
+            for window, block in zip(windows, attitude_blocks)
+        ]
+
+    unused = list(attitude_blocks)
+    attached: list[TimeWindow] = []
+    for window in windows:
+        match_idx = None
+        for idx, block in enumerate(unused):
+            if not block:
+                continue
+            if abs(block[0].time - window.start) <= 1.0 and abs(block[-1].time - window.end) <= 1.0:
+                match_idx = idx
+                break
+
+        block = unused.pop(match_idx) if match_idx is not None else ()
+        attached.append(
+            TimeWindow(
+                task_id=window.task_id,
+                sat_id=window.sat_id,
+                window_id=window.window_id,
+                start=window.start,
+                end=window.end,
+                duration=window.duration,
+                attitude_samples=block,
+            )
+        )
+    return attached
+
+
 def read_all_timewindows(data_dir: str | Path) -> List[TimeWindow]:
     """Read all outputtimewindow_*.txt files under data_dir."""
 
@@ -176,8 +295,49 @@ def read_all_timewindows(data_dir: str | Path) -> List[TimeWindow]:
         raise FileNotFoundError(f"No outputtimewindow_*.txt files found in {data_path}")
     all_windows: List[TimeWindow] = []
     for file_path in files:
-        all_windows.extend(read_timewindow_file(file_path))
+        windows = read_timewindow_file(file_path)
+        suffix = file_path.stem.replace("outputtimewindow_", "")
+        attitude_file = data_path / f"outputattitude_{suffix}.txt"
+        if attitude_file.is_file():
+            windows = attach_attitudes_to_windows(
+                windows,
+                read_attitude_file(attitude_file),
+            )
+        all_windows.extend(windows)
     return all_windows
+
+
+def interpolate_attitude(
+    samples: tuple[AttitudeSample, ...],
+    target_time: float,
+) -> tuple[float | None, float | None, float | None]:
+    """Return roll/pitch/yaw at target_time by linear interpolation."""
+
+    if not samples:
+        return None, None, None
+
+    if target_time <= samples[0].time:
+        sample = samples[0]
+        return sample.roll, sample.pitch, sample.yaw
+
+    if target_time >= samples[-1].time:
+        sample = samples[-1]
+        return sample.roll, sample.pitch, sample.yaw
+
+    for prev, curr in zip(samples, samples[1:]):
+        if prev.time <= target_time <= curr.time:
+            span = curr.time - prev.time
+            if abs(span) < 1e-12:
+                return curr.roll, curr.pitch, curr.yaw
+            ratio = (target_time - prev.time) / span
+            return (
+                prev.roll + ratio * (curr.roll - prev.roll),
+                prev.pitch + ratio * (curr.pitch - prev.pitch),
+                prev.yaw + ratio * (curr.yaw - prev.yaw),
+            )
+
+    sample = min(samples, key=lambda item: abs(item.time - target_time))
+    return sample.roll, sample.pitch, sample.yaw
 
 
 def build_candidate_nodes(tasks: Dict[int, Task], time_windows: Iterable[TimeWindow]) -> List[CandidateNode]:
@@ -192,6 +352,11 @@ def build_candidate_nodes(tasks: Dict[int, Task], time_windows: Iterable[TimeWin
         if tw.duration + 1e-9 < task.duration:
             # The observation cannot finish inside this visibility window.
             continue
+        roll, pitch, yaw = interpolate_attitude(tw.attitude_samples, tw.start)
+        end_roll, end_pitch, end_yaw = interpolate_attitude(
+            tw.attitude_samples,
+            tw.start + task.duration,
+        )
         node = CandidateNode(
             node_id=len(nodes),
             task_id=tw.task_id,
@@ -204,6 +369,12 @@ def build_candidate_nodes(tasks: Dict[int, Task], time_windows: Iterable[TimeWin
             task_duration=task.duration,
             coord_1=task.coord_1,
             coord_2=task.coord_2,
+            roll=roll,
+            pitch=pitch,
+            yaw=yaw,
+            end_roll=end_roll,
+            end_pitch=end_pitch,
+            end_yaw=end_yaw,
         )
         nodes.append(node)
     return nodes
@@ -217,11 +388,13 @@ def save_candidate_nodes_csv(nodes: Iterable[CandidateNode], file_path: str | Pa
         writer.writerow([
             "node_id", "task_id", "sat_id", "window_id", "start", "end", "duration",
             "profit", "task_duration", "coord_1", "coord_2",
+            "roll", "pitch", "yaw", "end_roll", "end_pitch", "end_yaw",
         ])
         for n in nodes:
             writer.writerow([
                 n.node_id, n.task_id, n.sat_id, n.window_id, n.start, n.end, n.duration,
                 n.profit, n.task_duration, n.coord_1, n.coord_2,
+                n.roll, n.pitch, n.yaw, n.end_roll, n.end_pitch, n.end_yaw,
             ])
 
 

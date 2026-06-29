@@ -18,7 +18,7 @@ TAG_ALIASES = {
     "sfmodbo": ("modbo", "MODBO"),
     "mopso": ("mopso", "MOPSO"),
     "spea2": ("spea2", "SPEA2"),
-    "moaco": ("moaco", "MOACO"),
+    # "moaco": ("moaco", "MOACO"),
     "nsga2": ("nsga2", "NSGA-II"),
 }
 

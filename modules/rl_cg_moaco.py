@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import csv
 import math
-from pathlib import Path
 import random
+from pathlib import Path
 import time
 from typing import Dict, Iterable, List, Sequence
 
@@ -28,7 +28,13 @@ from .rl_features import (
     max_load_std,
     transition_reference,
 )
-from .utils import Solution, crowding_distance, roulette_select, set_random_seed, update_archive
+from .utils import (
+    Solution,
+    crowding_distance,
+    roulette_select,
+    set_random_seed,
+    update_archive,
+)
 
 
 DEFAULT_PARAMS = {
@@ -90,7 +96,11 @@ class RLCGMOACO(CGMOACO):
         self.max_node_profit = max((node.profit for node in self.nodes), default=1.0)
         self.profit_by_id = {node.node_id: node.profit for node in self.nodes}
         self.transition_ref = transition_reference(self.nodes, self.params)
-        self.load_std_ref = max_load_std(len(self.tasks), len(self.satellite_ids))
+        if self.params.get("load_mode", "task_count") == "duration":
+            total_load = sum(task.duration for task in self.tasks.values())
+        else:
+            total_load = len(self.tasks)
+        self.load_std_ref = max_load_std(total_load, len(self.satellite_ids))
         self.input_dim = GLOBAL_FEATURE_DIM + NODE_FEATURE_DIM
         self.t_ref: int | None = None
         self.warmup_lengths: list[int] = []
@@ -132,9 +142,14 @@ class RLCGMOACO(CGMOACO):
         }
 
     def _node_load_amount(self, node: CandidateNode) -> float:
-        if self.params.get("load_mode", "task_count") == "duration":
-            return float(node.duration)
-        return 1.0
+        load_mode = self.params.get("load_mode", "task_count")
+
+        if load_mode == "task_count":
+            return 1.0
+        if load_mode == "duration":
+            return float(node.task_duration)
+
+        raise ValueError(f"Unknown load_mode: {load_mode}")
 
     def _current_epsilon(self, iteration: int, max_iter: int) -> float:
         if not self.params.get("use_ddqn", True):
@@ -208,13 +223,14 @@ class RLCGMOACO(CGMOACO):
         )
 
         load_before = load_std_from_loads(sat_loads, self.satellite_ids)
-        items = sorted(available)
+        items = self._candidate_pool(available)
+        max_load = max(1.0, max(sat_loads.values()) if sat_loads else 1.0)
         feature_rows: list[list[float]] = []
         infos: dict[int, dict[str, float]] = {}
         block_enabled = bool(self.params.get("use_block_penalty", True))
         for node_id in items:
             node = self.nodes_by_id[node_id]
-            eta = self._dynamic_heuristic(node_id, solution, sat_loads)
+            eta = self._dynamic_heuristic(node_id, solution, sat_loads, max_load)
             maneuver_delta = incremental_maneuver_cost(
                 node,
                 sat_sequences.get(node.sat_id, []),
@@ -469,9 +485,13 @@ class RLCGMOACO(CGMOACO):
         archive_size = int(self.params["archive_size"])
         warmup_iter = int(self.params.get("warmup_iter", 30))
         verbose = bool(self.params.get("verbose", True))
+        validate_each_solution = bool(self.params.get("validate_each_solution", False))
+        validate_interval = int(self.params.get("validate_interval", 20))
+        validate_final_archive = bool(self.params.get("validate_final_archive", True))
         episode_lengths: list[int] = []
 
         for iteration in range(1, max_iter + 1):
+            population: List[Solution] = []
             for _ in range(num_ants):
                 constructed, episode = self._construct_episode(iteration, max_iter)
                 episode_lengths.append(len(episode))
@@ -488,15 +508,24 @@ class RLCGMOACO(CGMOACO):
                     self.graph_features,
                     self.params,
                 )
-                if not is_feasible(improved, self.conflict_adj):
+                if validate_each_solution and not is_feasible(improved, self.conflict_adj):
                     continue
 
                 candidate = self._make_solution(improved)
+                population.append(candidate)
                 entered_archive = self._candidate_enters_archive(candidate, archive_size)
                 if self.t_ref is None:
                     self._pending_episodes.append((episode, entered_archive))
                 else:
                     self._store_episode(episode, entered_archive)
+
+            if validate_interval > 0 and iteration % validate_interval == 0:
+                for idx, sol in enumerate(population):
+                    if not is_feasible(sol.node_ids, self.conflict_adj):
+                        raise RuntimeError(
+                            "RL-CG-MOACO produced infeasible solution at "
+                            f"iteration {iteration}, population index {idx}"
+                        )
 
             if self.t_ref is None and iteration >= warmup_iter:
                 self._finish_warmup()
@@ -520,12 +549,12 @@ class RLCGMOACO(CGMOACO):
                 self.avg_episode_length = sum(episode_lengths) / len(episode_lengths)
 
             if verbose and (iteration == 1 or iteration % max(1, max_iter // 10) == 0 or iteration == max_iter):
-                best_profit_ratio = min((s.objectives[0] for s in self.archive), default=float("nan"))
+                best_total_profit = max((-s.objectives[0] for s in self.archive), default=float("nan"))
                 last_loss = self.agent.last_loss if self.agent is not None else None
                 loss_text = f"{last_loss:.4g}" if last_loss is not None else "NA"
                 print(
                     f"[RL-CG-MOACO] Iter {iteration:>4}/{max_iter}: "
-                    f"archive={len(self.archive):>3}, best_f1={best_profit_ratio:.4f}, "
+                    f"archive={len(self.archive):>3}, best_f1={best_total_profit:.4f}, "
                     f"T_ref={self.t_ref}, eps={self.last_epsilon:.3f}, "
                     f"kappa={self.last_kappa:.3f}, adv_span={self.last_advantage_span:.3f}, "
                     f"loss={loss_text}"
@@ -533,6 +562,14 @@ class RLCGMOACO(CGMOACO):
 
         if self.t_ref is None:
             self._finish_warmup()
+
+        if validate_final_archive:
+            for idx, sol in enumerate(self.archive):
+                if not is_feasible(sol.node_ids, self.conflict_adj):
+                    raise RuntimeError(
+                        "RL-CG-MOACO final archive contains infeasible "
+                        f"solution at index {idx}"
+                    )
 
         self.runtime_seconds = time.perf_counter() - start_time
         return self.archive
@@ -543,7 +580,7 @@ class RLCGMOACO(CGMOACO):
         with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "solution_index", "f1_uncompleted_profit_ratio", "f2_maneuver_cost", "f3_load_imbalance",
+                "solution_index", "f1_total_profit", "f2_maneuver_cost", "f3_load_imbalance",
                 "scheduled_nodes", "scheduled_tasks", "task_completion_rate", "node_ids",
             ])
             total_task_count = len(self.tasks)
@@ -551,7 +588,7 @@ class RLCGMOACO(CGMOACO):
                 scheduled_tasks = {self.nodes_by_id[nid].task_id for nid in sol.node_ids}
                 writer.writerow([
                     idx,
-                    sol.objectives[0],
+                    -sol.objectives[0],
                     sol.objectives[1],
                     sol.objectives[2],
                     len(sol.node_ids),

@@ -61,8 +61,10 @@ def build_conflict_graph(nodes: List[CandidateNode], params: dict | None = None)
 
     Conflict types:
     1. Same task mutual exclusion.
-    2. Same-satellite fixed execution intervals overlap or leave insufficient
-       maneuver transition time.
+    2. Same satellite cannot execute overlapping fixed observation intervals.
+    3. Each actual observation interval must fit inside its visibility window.
+    4. Adjacent same-satellite observations must leave enough attitude
+       transition time.
     """
 
     conflict_adj: dict[int, set[int]] = {node.node_id: set() for node in nodes}

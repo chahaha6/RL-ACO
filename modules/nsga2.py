@@ -1,40 +1,3 @@
-"""NSGA-II 对比算法模块。
-
-本文件实现的是适配当前 CG-MOACO 项目接口的 NSGA-II 对照算法。
-
-设计定位：
-    1. NSGA-II 作为经典 Pareto 支配类多目标进化算法；
-    2. 用于和 CG-MOACO、MOACO、SFMODBO 进行公平对比；
-    3. 不使用 CG-MOACO 的冲突图启发式、信息素机制和局部搜索；
-    4. 只使用 conflict_adj 做可行性解码/约束检查；
-    5. 目标函数统一调用 problem_model.evaluate_solution()。
-
-编码方式：
-    采用连续随机键编码 random-key vector。
-
-    假设共有 N 个任务-卫星-窗口候选节点，则一个个体为：
-
-        chromosome = [x1, x2, ..., xN]
-
-    每一维对应一个候选节点。
-    解码时按照 chromosome 的值从大到小排序，依次尝试选择候选节点。
-    如果该节点与当前已选节点不冲突，则加入调度方案。
-
-    因此，NSGA-II 的遗传操作在连续随机键空间中进行，
-    每个染色体通过贪婪解码转成一个可行调度方案。
-
-注意：
-    1. 本文件不设置 max_iter；
-       所有算法的迭代次数统一由 main.py 中的 GENERATIONS 控制，
-       并通过 params["max_iter"] 传入。
-
-    2. 本文件不设置问题模型参数；
-       min_transition_time、maneuver_time_per_degree、load_mode 等
-       由 problem_model.py 统一管理。
-
-    3. 本文件只保留 NSGA-II 自身参数。
-"""
-
 from __future__ import annotations
 
 import csv
@@ -79,10 +42,12 @@ DEFAULT_PARAMS = {
     # mutation_probability：多项式变异概率；若为 None，则默认 1 / dimension
     # eta_c：SBX 分布指数，越大子代越接近父代
     # eta_m：多项式变异分布指数，越大变异幅度越小
-    "crossover_probability": 0.9,
+    "crossover_probability": 0.8,
     "mutation_probability": None,
-    "eta_c": 20.0,
+    "eta_c": 15.0,
     "eta_m": 20.0,
+    "ref_front_file": None,
+    "print_every": 10,
 
     # ---------- 锦标赛选择 ----------
     "tournament_size": 2,
@@ -115,16 +80,41 @@ class NSGA2:
         params: dict | None = None,
         satellite_ids: Sequence[int] | None = None,
         model_params: dict | None = None,
+        pop_size: int | None = None,
+        generations: int | None = None,
+        ref_front_file: str | Path | None = None,
+        seed: int | None = None,
+        crossover_prob: float | None = None,
+        crossover_eta: float | None = None,
+        mutation_eta: float | None = None,
+        mutation_probability: float | None = None,
+        print_every: int | None = None,
     ) -> None:
         # 合并默认参数和外部参数
         self.params = {**DEFAULT_PARAMS, **(params or {})}
+        self._apply_pymoo_style_aliases()
+
+        explicit_overrides = {
+            "pop_size": pop_size,
+            "max_iter": generations,
+            "ref_front_file": ref_front_file,
+            "seed": seed,
+            "crossover_probability": crossover_prob,
+            "eta_c": crossover_eta,
+            "eta_m": mutation_eta,
+            "mutation_probability": mutation_probability,
+            "print_every": print_every,
+        }
+        for key, value in explicit_overrides.items():
+            if value is not None:
+                self.params[key] = value
         self.model_params = {**DEFAULT_MODEL_PARAMS, **(model_params or {})}
 
         # max_iter 必须由 main.py 统一传入
         if "max_iter" not in self.params:
             raise ValueError(
                 "NSGA2 requires params['max_iter']. "
-                "Please pass it from main.py using GENERATIONS."
+                "Please pass it from main.py using ITERATION_COUNT or generations."
             )
 
         # 设置随机种子
@@ -149,6 +139,19 @@ class NSGA2:
         self.archive: List[Solution] = []
 
         self.runtime_seconds = 0.0
+
+    def _apply_pymoo_style_aliases(self) -> None:
+        """Map familiar NSGA2_PYMOO-style names to this implementation."""
+
+        alias_map = {
+            "generations": "max_iter",
+            "crossover_prob": "crossover_probability",
+            "crossover_eta": "eta_c",
+            "mutation_eta": "eta_m",
+        }
+        for old_key, new_key in alias_map.items():
+            if old_key in self.params and self.params[old_key] is not None:
+                self.params[new_key] = self.params[old_key]
 
     # =====================================================
     # 随机键编码与解码
@@ -552,6 +555,8 @@ class NSGA2:
 
         max_iter = int(self.params["max_iter"])
         verbose = bool(self.params.get("verbose", True))
+        print_every = self.params.get("print_every")
+        print_every = int(print_every) if print_every is not None else None
 
         self._initialize_population()
 
@@ -567,13 +572,22 @@ class NSGA2:
 
             self._update_archive_from_population()
 
-            if verbose and (
+            should_print = (
                 iteration == 1
-                or iteration % max(1, max_iter // 10) == 0
                 or iteration == max_iter
-            ):
-                best_f1 = min(
-                    (s.objectives[0] for s in self.archive),
+                or (
+                    print_every is not None
+                    and iteration % max(1, print_every) == 0
+                )
+                or (
+                    print_every is None
+                    and iteration % max(1, max_iter // 10) == 0
+                )
+            )
+
+            if verbose and should_print:
+                best_f1 = max(
+                    (-s.objectives[0] for s in self.archive),
                     default=float("nan"),
                 )
 
@@ -602,7 +616,7 @@ class NSGA2:
             writer.writerow(
                 [
                     "solution_index",
-                    "f1_uncompleted_profit_ratio",
+                    "f1_total_profit",
                     "f2_maneuver_cost",
                     "f3_load_imbalance",
                     "scheduled_nodes",
@@ -623,7 +637,7 @@ class NSGA2:
                 writer.writerow(
                     [
                         idx,
-                        sol.objectives[0],
+                        -sol.objectives[0],
                         sol.objectives[1],
                         sol.objectives[2],
                         len(sol.node_ids),

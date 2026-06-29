@@ -28,3 +28,9 @@ class CandidateNode:
     task_duration: float
     coord_1: float
     coord_2: float
+    roll: float | None = None
+    pitch: float | None = None
+    yaw: float | None = None
+    end_roll: float | None = None
+    end_pitch: float | None = None
+    end_yaw: float | None = None

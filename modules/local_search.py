@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-from typing import Dict, Iterable, List, Sequence, Set
+from heapq import nlargest
+from typing import Dict, Iterable, List, Sequence
 
 from .domain import CandidateNode, Task
-from .problem_model import calculate_maneuver_cost, evaluate_solution
+from .problem_model import evaluate_solution
 from .utils import dominates
 
 
@@ -18,15 +18,45 @@ def _is_node_feasible_for_solution(node_id: int, solution: set[int], conflict_ad
     return not (conflict_adj.get(node_id, set()) & solution)
 
 
+def _node_load_amount(node: CandidateNode, params: dict) -> float:
+    """Return the load contribution of one scheduled node.
+
+    The definition is kept consistent with problem_model.calculate_load_balance:
+    - task_count: each scheduled task contributes 1 load unit;
+    - duration: each scheduled task contributes its actual observation duration.
+    """
+
+    load_mode = params.get("load_mode", "task_count")
+
+    if load_mode == "task_count":
+        return 1.0
+    if load_mode == "duration":
+        return float(node.task_duration)
+
+    raise ValueError(f"Unknown load_mode: {load_mode}")
+
+
+def _sat_loads(
+    solution: Iterable[int],
+    nodes_by_id: Dict[int, CandidateNode],
+    params: dict,
+) -> dict[int, float]:
+    loads: dict[int, float] = {}
+    for node_id in solution:
+        node = nodes_by_id[node_id]
+        loads[node.sat_id] = loads.get(node.sat_id, 0.0) + _node_load_amount(node, params)
+    return loads
+
+
 def _dynamic_insert_score(
     node: CandidateNode,
-    solution: set[int],
-    nodes_by_id: Dict[int, CandidateNode],
+    sat_loads: dict[int, float],
+    total_solution_load: float,
     graph_features: dict[str, dict[int, float]],
     params: dict,
 ) -> float:
-    sat_load = sum(1 for nid in solution if nodes_by_id[nid].sat_id == node.sat_id)
-    max_load = max(1, len(solution))
+    sat_load = sat_loads.get(node.sat_id, 0.0)
+    max_load = max(1.0, total_solution_load)
     norm_load = sat_load / max_load
     nid = node.node_id
     numerator = graph_features["norm_profit"][nid] + params.get("lambda_scarcity", 1.0) * graph_features["norm_scarcity"][nid]
@@ -37,6 +67,28 @@ def _dynamic_insert_score(
         + params.get("lambda_load", 1.0) * norm_load
     )
     return max(1e-9, numerator / denominator)
+
+
+def _rank_candidate_nodes(
+    candidate_nodes: list[CandidateNode],
+    limit: int,
+    sat_loads: dict[int, float],
+    total_solution_load: float,
+    graph_features: dict[str, dict[int, float]],
+    params: dict,
+) -> list[CandidateNode]:
+    def score(node: CandidateNode) -> float:
+        return _dynamic_insert_score(
+            node,
+            sat_loads,
+            total_solution_load,
+            graph_features,
+            params,
+        )
+
+    if limit > 0 and len(candidate_nodes) > limit:
+        return nlargest(limit, candidate_nodes, key=score)
+    return sorted(candidate_nodes, key=score, reverse=True)
 
 
 def conflict_aware_fast_insert(
@@ -51,18 +103,27 @@ def conflict_aware_fast_insert(
 
     improved = set(solution)
     scheduled_tasks = _selected_tasks(improved, nodes_by_id)
+    sat_loads = _sat_loads(improved, nodes_by_id, params)
+    total_solution_load = sum(sat_loads.values())
     candidate_nodes = [node for node in nodes if node.task_id not in scheduled_tasks]
-    candidate_nodes.sort(
-        key=lambda n: _dynamic_insert_score(n, improved, nodes_by_id, graph_features, params),
-        reverse=True,
+    candidate_nodes = _rank_candidate_nodes(
+        candidate_nodes,
+        int(params.get("local_search_candidate_limit", 0)),
+        sat_loads,
+        total_solution_load,
+        graph_features,
+        params,
     )
 
     for node in candidate_nodes:
         if node.task_id in scheduled_tasks:
             continue
         if _is_node_feasible_for_solution(node.node_id, improved, conflict_adj):
+            node_load = _node_load_amount(node, params)
             improved.add(node.node_id)
             scheduled_tasks.add(node.task_id)
+            sat_loads[node.sat_id] = sat_loads.get(node.sat_id, 0.0) + node_load
+            total_solution_load += node_load
     return improved
 
 
@@ -81,11 +142,23 @@ def conflict_aware_replacement(
     improved = set(solution)
     scheduled_tasks = _selected_tasks(improved, nodes_by_id)
     old_obj = evaluate_solution(improved, nodes_by_id, tasks, satellite_ids, params)
+    sat_loads = _sat_loads(improved, nodes_by_id, params)
+    total_solution_load = sum(sat_loads.values())
 
     unscheduled_nodes = [node for node in nodes if node.task_id not in scheduled_tasks]
-    unscheduled_nodes.sort(
-        key=lambda n: _dynamic_insert_score(n, improved, nodes_by_id, graph_features, params),
-        reverse=True,
+    candidate_limit = int(
+        params.get(
+            "replacement_candidate_limit",
+            params.get("local_search_candidate_limit", 0),
+        )
+    )
+    unscheduled_nodes = _rank_candidate_nodes(
+        unscheduled_nodes,
+        candidate_limit,
+        sat_loads,
+        total_solution_load,
+        graph_features,
+        params,
     )
 
     max_attempts = params.get("replacement_attempts", 100)
@@ -122,6 +195,8 @@ def conflict_aware_replacement(
         if dominates(new_obj, old_obj) or new_scalar < old_scalar:
             improved = trial
             scheduled_tasks = _selected_tasks(improved, nodes_by_id)
+            sat_loads = _sat_loads(improved, nodes_by_id, params)
+            total_solution_load = sum(sat_loads.values())
             old_obj = new_obj
     return improved
 

@@ -1,0 +1,13 @@
+﻿Run,ExperimentGroup,Algorithm,Tag,Case,Param_Set,Archive_size,Profit_max,Load_min,Attitude_min,Quality_max,Representative_Profit,Representative_Load,Representative_Attitude,Representative_Quality,Task_count_mean,Representative_Index,Final_feasible_count,Final_candidate_count,Best_completion_rate,Runtime_seconds,RL_T_ref,RL_avg_episode_length,RL_last_train_loss,RL_last_epsilon,RL_last_kappa,RL_last_q_baseline,RL_last_advantage_span,RL_replay_size,Candidate_nodes,Conflict_edges,Param_overrides
+1,comparison,MODBO,modbo,world_s5_t400,modbo,8,2774.0,0.4,10208.377106500007,,2774.0,0.4,10496.33695803334,,394,0,8,8,0.985,504.2706838000013,,,,,,,,,2619,9728,{}
+2,comparison,MODBO,modbo,world_s5_t400,modbo,10,2774.0,0.4,9826.397255999997,,2774.0,0.4,10203.113330333324,,394,0,10,10,0.985,566.3473689000093,,,,,,,,,2619,9728,{}
+3,comparison,MODBO,modbo,world_s5_t400,modbo,7,2774.0,0.4,10133.61004532635,,2774.0,1.16619037896906,10324.282207559681,,394,2,7,7,0.985,571.9316124999896,,,,,,,,,2619,9728,{}
+4,comparison,MODBO,modbo,world_s5_t400,modbo,5,2774.0,0.4,9681.505716666667,,2774.0,0.4,9977.4487911,,394,3,5,5,0.985,644.7544068999996,,,,,,,,,2619,9728,{}
+5,comparison,MODBO,modbo,world_s5_t400,modbo,6,2774.0,0.4,9929.542226466681,,2774.0,0.4,10210.347477366688,,394,0,6,6,0.985,512.1229854999983,,,,,,,,,2619,9728,{}
+6,comparison,MODBO,modbo,world_s5_t400,modbo,4,2774.0,0.4,9569.091907366648,,2774.0,0.4,9606.148794833323,,394,0,4,4,0.985,593.9263111000037,,,,,,,,,2619,9728,{}
+7,comparison,MODBO,modbo,world_s5_t400,modbo,5,2774.0,0.4,9658.156910766667,,2774.0,2.039607805437114,9690.972801766662,,394,0,5,5,0.985,604.4830109000031,,,,,,,,,2619,9728,{}
+8,comparison,MODBO,modbo,world_s5_t400,modbo,5,2774.0,0.4,9741.585183966656,,2774.0,0.9797958971132712,9793.589976599987,,394,0,5,5,0.985,591.7866627999902,,,,,,,,,2619,9728,{}
+9,comparison,MODBO,modbo,world_s5_t400,modbo,8,2774.0,0.4,9679.037536433327,,2774.0,0.9797958971132712,9874.99957146666,,394,0,8,8,0.985,379.71324480000476,,,,,,,,,2619,9728,{}
+10,comparison,MODBO,modbo,world_s5_t400,modbo,8,2774.0,0.4,9693.09562520001,,2774.0,0.4,10028.671455833335,,394,0,8,8,0.985,277.6563466999942,,,,,,,,,2619,9728,{}
+Average,comparison,MODBO,modbo,world_s5_t400,modbo,6.6,2774.0,0.4,9812.039951469302,,2774.0,0.7565389978632716,10020.5911364893,,394.0,,6.6,6.6,0.985,524.6992633899994,,,,,,,,,2619.0,9728.0,{}
+Std,comparison,MODBO,modbo,world_s5_t400,modbo,1.8,0.0,0.0,202.74308391894,,0.0,0.5173477985959123,272.57069882493613,,0.0,,1.8,1.8,0.0,108.01105709237414,,,,,,,,,0.0,0.0,{}
