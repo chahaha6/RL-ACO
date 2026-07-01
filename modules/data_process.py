@@ -9,14 +9,14 @@ from typing import Dict, Iterable, List
 
 try:
     from .domain import CandidateNode, Task
-    from .utils import parse_time_to_seconds
+    from .utils import observation_fits_window, parse_time_to_seconds
 except ImportError:
     from domain import CandidateNode, Task
-    from utils import parse_time_to_seconds
+    from utils import observation_fits_window, parse_time_to_seconds
 
-DEFAULT_DATASET_PREFIX = "world"
+DEFAULT_DATASET_PREFIX = "area"
 SATELLITE_COUNT = 5
-TASK_COUNT = 1000
+TASK_COUNT = 700
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_DATA_ROOT = PROJECT_ROOT / "Local_Data"
 CSV_DATA_ROOT = PROJECT_ROOT / "CSV_DATA"
@@ -349,7 +349,7 @@ def build_candidate_nodes(tasks: Dict[int, Task], time_windows: Iterable[TimeWin
         if task is None:
             # Ignore windows for tasks not present in tasklist.
             continue
-        if tw.duration + 1e-9 < task.duration:
+        if not observation_fits_window(tw.start, tw.end, task.duration):
             # The observation cannot finish inside this visibility window.
             continue
         roll, pitch, yaw = interpolate_attitude(tw.attitude_samples, tw.start)

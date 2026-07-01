@@ -11,7 +11,7 @@ from typing import Iterable, List
 
 from .domain import CandidateNode
 from .problem_model import estimate_transition_time
-from .utils import normalize_dict
+from .utils import normalize_dict, observation_fits_window, time_not_after
 
 
 def add_undirected_edge(adj: dict[int, set[int]], a: int, b: int) -> None:
@@ -38,20 +38,20 @@ def has_maneuver_conflict(
 
     execution_end_a = node_a.start + node_a.task_duration
     execution_end_b = node_b.start + node_b.task_duration
-    if execution_end_a > node_a.end + 1e-9:
+    if not observation_fits_window(node_a.start, node_a.end, node_a.task_duration):
         return True
-    if execution_end_b > node_b.end + 1e-9:
+    if not observation_fits_window(node_b.start, node_b.end, node_b.task_duration):
         return True
 
-    if execution_end_a <= node_b.start:
-        return (
-            execution_end_a + estimate_transition_time(node_a, node_b, params)
-            > node_b.start
+    if time_not_after(execution_end_a, node_b.start):
+        return not time_not_after(
+            execution_end_a + estimate_transition_time(node_a, node_b, params),
+            node_b.start,
         )
-    if execution_end_b <= node_a.start:
-        return (
-            execution_end_b + estimate_transition_time(node_b, node_a, params)
-            > node_a.start
+    if time_not_after(execution_end_b, node_a.start):
+        return not time_not_after(
+            execution_end_b + estimate_transition_time(node_b, node_a, params),
+            node_a.start,
         )
     return True
 
@@ -66,6 +66,15 @@ def build_conflict_graph(nodes: List[CandidateNode], params: dict | None = None)
     4. Adjacent same-satellite observations must leave enough attitude
        transition time.
     """
+
+    for node in nodes:
+        if not observation_fits_window(node.start, node.end, node.task_duration):
+            actual_duration = node.end - node.start
+            raise ValueError(
+                f"Candidate node {node.node_id} cannot fit inside its visibility "
+                f"window: end-start={actual_duration:.9f}, "
+                f"task_duration={node.task_duration:.9f}"
+            )
 
     conflict_adj: dict[int, set[int]] = {node.node_id: set() for node in nodes}
 

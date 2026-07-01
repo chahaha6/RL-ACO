@@ -11,7 +11,6 @@ from .domain import CandidateNode, Task
 from .problem_model import (
     DEFAULT_MODEL_PARAMS,
     evaluate_solution,
-    is_feasible,
     task_completion_rate,
 )
 from .utils import Solution, dominates, set_random_seed, update_archive
@@ -248,33 +247,7 @@ class SFMODBO:
         """评价一个连续位置向量。"""
 
         node_ids = self._decode_position(position)
-
-        # 正常情况下，随机键贪婪解码已经能生成可行解。
-        # 这里保留防御性修复，避免异常情况。
-        if not is_feasible(node_ids, self.conflict_adj):
-            node_ids = self._repair_by_conflict_removal(node_ids)
-
         return self._make_solution(node_ids)
-
-    def _repair_by_conflict_removal(
-        self,
-        node_ids: Iterable[int],
-    ) -> set[int]:
-        """防御性修复：如果解中存在冲突，则按收益优先保留节点。"""
-
-        repaired: set[int] = set()
-
-        ordered = sorted(
-            node_ids,
-            key=lambda nid: self.nodes_by_id[nid].profit,
-            reverse=True,
-        )
-
-        for nid in ordered:
-            if not (self.conflict_adj.get(nid, set()) & repaired):
-                repaired.add(nid)
-
-        return repaired
 
     # =====================================================
     # 多目标比较与接受准则

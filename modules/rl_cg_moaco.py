@@ -13,7 +13,7 @@ from typing import Dict, Iterable, List, Sequence
 from .cg_moaco import CGMOACO, DEFAULT_PARAMS as CG_DEFAULT_PARAMS
 from .ddqn_agent import DDQNAgent, ReplayTransition
 from .domain import CandidateNode, Task
-from .local_search import local_search
+from .local_search import pareto_local_search
 from .problem_model import evaluate_solution, is_feasible, task_completion_rate
 from .rl_features import (
     GLOBAL_FEATURE_DIM,
@@ -33,7 +33,7 @@ from .utils import (
     crowding_distance,
     roulette_select,
     set_random_seed,
-    update_archive,
+    update_archive_with_acceptance,
 )
 
 
@@ -94,7 +94,8 @@ class RLCGMOACO(CGMOACO):
         set_random_seed(self.params.get("seed"))
         self.total_profit = sum(task.profit for task in self.tasks.values())
         self.max_node_profit = max((node.profit for node in self.nodes), default=1.0)
-        self.profit_by_id = {node.node_id: node.profit for node in self.nodes}
+        self.task_id_by_node = {node.node_id: node.task_id for node in self.nodes}
+        self.profit_by_task = {task_id: task.profit for task_id, task in self.tasks.items()}
         self.transition_ref = transition_reference(self.nodes, self.params)
         if self.params.get("load_mode", "task_count") == "duration":
             total_load = sum(task.duration for task in self.tasks.values())
@@ -203,6 +204,7 @@ class RLCGMOACO(CGMOACO):
         selected_profit: float,
         current_maneuver: float,
         available_profit_sum: float,
+        available_task_node_counts: dict[int, int],
     ) -> tuple[list[int], list[list[float]], dict[int, dict[str, float]]]:
         global_features = build_global_features(
             solution_size=len(solution),
@@ -230,7 +232,7 @@ class RLCGMOACO(CGMOACO):
         block_enabled = bool(self.params.get("use_block_penalty", True))
         for node_id in items:
             node = self.nodes_by_id[node_id]
-            eta = self._dynamic_heuristic(node_id, solution, sat_loads, max_load)
+            eta = self._dynamic_heuristic(node_id, sat_loads, max_load)
             maneuver_delta = incremental_maneuver_cost(
                 node,
                 sat_sequences.get(node.sat_id, []),
@@ -239,7 +241,9 @@ class RLCGMOACO(CGMOACO):
             block_value = block_penalty(
                 node_id,
                 available,
-                self.profit_by_id,
+                self.task_id_by_node,
+                self.profit_by_task,
+                available_task_node_counts,
                 self.conflict_adj,
                 available_profit_sum,
                 enabled=block_enabled,
@@ -263,7 +267,7 @@ class RLCGMOACO(CGMOACO):
                 node=node,
                 graph_features=self.graph_features,
                 sat_loads=sat_loads,
-                solution_size=len(solution),
+                total_solution_load=sum(sat_loads.values()),
                 tau=max(float(self.params["tau_min"]), self.pheromone[node_id]),
                 tau_min=float(self.params["tau_min"]),
                 tau_max=float(self.params["tau_max"]),
@@ -344,7 +348,16 @@ class RLCGMOACO(CGMOACO):
         sat_sequences: dict[int, list[CandidateNode]] = {sat_id: [] for sat_id in self.satellite_ids}
         selected_profit = 0.0
         current_maneuver = 0.0
-        available_profit_sum = sum(self.profit_by_id.values())
+        available_task_node_counts: dict[int, int] = {}
+        for node in self.nodes:
+            available_task_node_counts[node.task_id] = (
+                available_task_node_counts.get(node.task_id, 0) + 1
+            )
+        available_profit_sum = sum(
+            self.profit_by_task[task_id]
+            for task_id, count in available_task_node_counts.items()
+            if count > 0
+        )
         episode: list[_RawTransition] = []
         pending_state_action: list[float] | None = None
         pending_raw_score = 0.0
@@ -358,6 +371,7 @@ class RLCGMOACO(CGMOACO):
                 selected_profit=selected_profit,
                 current_maneuver=current_maneuver,
                 available_profit_sum=available_profit_sum,
+                available_task_node_counts=available_task_node_counts,
             )
             if pending_state_action is not None:
                 episode.append(
@@ -387,7 +401,12 @@ class RLCGMOACO(CGMOACO):
             insert_sorted_by_start(sat_sequences.setdefault(chosen_node.sat_id, []), chosen_node)
 
             removed = {chosen} | (self.conflict_adj.get(chosen, set()) & available)
-            available_profit_sum -= sum(self.profit_by_id[nid] for nid in removed)
+            for removed_id in removed:
+                task_id = self.task_id_by_node[removed_id]
+                remaining_count = available_task_node_counts[task_id] - 1
+                available_task_node_counts[task_id] = remaining_count
+                if remaining_count == 0:
+                    available_profit_sum -= self.profit_by_task[task_id]
             available.difference_update(removed)
             available_profit_sum = max(0.0, available_profit_sum)
 
@@ -404,13 +423,6 @@ class RLCGMOACO(CGMOACO):
                 )
             )
         return solution, episode
-
-    def _candidate_enters_archive(self, candidate: Solution, archive_size: int) -> bool:
-        before = {sol.node_ids for sol in self.archive}
-        updated = update_archive(self.archive, [candidate], archive_size)
-        after = {sol.node_ids for sol in updated}
-        self.archive = updated
-        return candidate.node_ids in after and candidate.node_ids not in before
 
     def _store_episode(self, episode: list[_RawTransition], entered_archive: bool) -> None:
         if self.agent is None or not episode:
@@ -498,22 +510,31 @@ class RLCGMOACO(CGMOACO):
                 if iteration <= warmup_iter and self.t_ref is None:
                     self.warmup_lengths.append(len(episode))
 
-                improved = local_search(
-                    constructed,
-                    self.nodes,
-                    self.nodes_by_id,
-                    self.conflict_adj,
-                    self.tasks,
-                    self.satellite_ids,
-                    self.graph_features,
-                    self.params,
-                )
-                if validate_each_solution and not is_feasible(improved, self.conflict_adj):
+                if validate_each_solution and not is_feasible(constructed, self.conflict_adj):
                     continue
 
-                candidate = self._make_solution(improved)
-                population.append(candidate)
-                entered_archive = self._candidate_enters_archive(candidate, archive_size)
+                current = self._make_solution(constructed)
+                self.archive, constructed_entered = update_archive_with_acceptance(
+                    self.archive,
+                    current,
+                    archive_size,
+                )
+                local_entered = False
+                if constructed_entered and self.params.get("enable_local_search", True):
+                    current, self.archive, local_entered = pareto_local_search(
+                        current,
+                        self.archive,
+                        archive_size,
+                        self.nodes,
+                        self.nodes_by_id,
+                        self.conflict_adj,
+                        self.tasks,
+                        self.satellite_ids,
+                        self.params,
+                    )
+
+                population.append(current)
+                entered_archive = constructed_entered or local_entered
                 if self.t_ref is None:
                     self._pending_episodes.append((episode, entered_archive))
                 else:

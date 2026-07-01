@@ -14,6 +14,37 @@ import random
 from typing import Iterable, List, Sequence, Tuple
 
 
+# Scheduling timestamps are stored as floating-point seconds. This tolerance
+# only absorbs arithmetic noise; a genuine millisecond-level overrun remains
+# infeasible.
+TIME_TOLERANCE_SECONDS = 1e-6
+
+
+def time_not_after(
+    value: float,
+    limit: float,
+    tolerance: float = TIME_TOLERANCE_SECONDS,
+) -> bool:
+    """Return whether ``value`` is no later than ``limit`` within tolerance."""
+
+    return float(value) <= float(limit) + float(tolerance)
+
+
+def observation_fits_window(
+    start: float,
+    end: float,
+    task_duration: float,
+    tolerance: float = TIME_TOLERANCE_SECONDS,
+) -> bool:
+    """Return whether a fixed-start observation finishes inside its window."""
+
+    return time_not_after(
+        float(start) + float(task_duration),
+        float(end),
+        tolerance,
+    )
+
+
 @dataclass(frozen=True)
 class Solution:
     """A scheduled solution and its objective vector.
@@ -138,13 +169,13 @@ def crowding_distance(solutions: Sequence[Solution]) -> dict[int, float]:
     m = len(solutions[0].objectives)
     for obj_idx in range(m):
         order = sorted(range(n), key=lambda idx: solutions[idx].objectives[obj_idx])
-        distances[order[0]] = float("inf")
-        distances[order[-1]] = float("inf")
         min_v = solutions[order[0]].objectives[obj_idx]
         max_v = solutions[order[-1]].objectives[obj_idx]
         denom = max_v - min_v
-        if math.isclose(denom, 0.0):
+        if math.isclose(denom, 0.0, abs_tol=1e-12):
             continue
+        distances[order[0]] = float("inf")
+        distances[order[-1]] = float("inf")
         for pos in range(1, n - 1):
             prev_v = solutions[order[pos - 1]].objectives[obj_idx]
             next_v = solutions[order[pos + 1]].objectives[obj_idx]
@@ -173,6 +204,57 @@ def update_archive(
             remove_idx = min(finite_items, key=lambda item: item[1])[0]
             kept.pop(remove_idx)
     return kept
+
+
+def update_archive_with_acceptance(
+    archive: Sequence[Solution],
+    candidate: Solution,
+    archive_size: int,
+) -> tuple[List[Solution], bool]:
+    """Incrementally update a non-dominated archive with one candidate.
+
+    A duplicate schedule is not considered a new archive entry. A
+    non-dominated candidate also counts as rejected when archive truncation
+    removes it. Existing archive members are already mutually non-dominated,
+    so only candidate-to-archive comparisons are required.
+    """
+
+    existing_node_sets = {solution.node_ids for solution in archive}
+    if candidate.node_ids in existing_node_sets:
+        return list(archive), False
+
+    dominated_indices: set[int] = set()
+    for idx, solution in enumerate(archive):
+        if dominates(solution.objectives, candidate.objectives):
+            return list(archive), False
+        if dominates(candidate.objectives, solution.objectives):
+            dominated_indices.add(idx)
+
+    updated = [
+        solution
+        for idx, solution in enumerate(archive)
+        if idx not in dominated_indices
+    ]
+    updated.append(candidate)
+
+    while len(updated) > archive_size:
+        distances = crowding_distance(updated)
+        finite_items = [
+            (idx, distance)
+            for idx, distance in distances.items()
+            if math.isfinite(distance)
+        ]
+        if not finite_items:
+            updated.pop(-1)
+        else:
+            remove_idx = min(finite_items, key=lambda item: item[1])[0]
+            updated.pop(remove_idx)
+
+    accepted = any(
+        solution.node_ids == candidate.node_ids
+        for solution in updated
+    )
+    return updated, accepted
 
 
 def roulette_select(items: Sequence[int], weights: Sequence[float]) -> int:

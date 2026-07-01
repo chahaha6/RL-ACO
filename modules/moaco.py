@@ -8,12 +8,19 @@ import time
 from typing import Dict, Iterable, List, Sequence
 
 from .domain import CandidateNode, Task
-from .problem_model import evaluate_solution, estimate_transition_time, is_feasible, task_completion_rate
+from .problem_model import (
+    evaluate_solution,
+    estimate_transition_time,
+    node_load_amount,
+    task_completion_rate,
+)
 from .utils import (
     Solution,
     normalize_dict,
+    observation_fits_window,
     roulette_select,
     set_random_seed,
+    time_not_after,
     update_archive,
 )
 
@@ -22,15 +29,16 @@ DEFAULT_PARAMS = {
     "num_ants": 50,
     "max_iter": 300,
     "archive_size": 100,
-    "alpha": 1.0,
-    "beta": 2.0,
-    "rho": 0.1,
-    "q": 0.2,
+    "alpha": 0.7,
+    "beta": 1.4,
+    "rho": 0.15,
+    "q": 0.1,
     "tau0": 1.0,
     "tau_min": 1e-6,
-    "tau_max": 50.0,
+    "tau_max": 30.0,
     "candidate_pool_size": 200,
     "candidate_random_ratio": 0.1,
+    "lambda_load": 1.0,
     "load_mode": "task_count",
     "validate_each_solution": False,
     "validate_interval": 20,
@@ -41,13 +49,12 @@ DEFAULT_PARAMS = {
 
 
 class MOACO:
-    """Plain MOACO baseline with the same problem interface as CGMOACO."""
+    """Plain MOACO baseline using direct scheduling-constraint checks."""
 
     def __init__(
         self,
         tasks: Dict[int, Task],
         nodes: List[CandidateNode],
-        conflict_adj: dict[int, set[int]],
         params: dict | None = None,
         satellite_ids: Sequence[int] | None = None,
     ) -> None:
@@ -56,13 +63,19 @@ class MOACO:
         self.tasks = tasks
         self.nodes = nodes
         self.nodes_by_id = {node.node_id: node for node in nodes}
-        self.conflict_adj = conflict_adj
+        self.node_ids_by_task: dict[int, set[int]] = {}
+        for node in nodes:
+            self.node_ids_by_task.setdefault(node.task_id, set()).add(node.node_id)
         self.satellite_ids = sorted(
             set(satellite_ids) if satellite_ids is not None else {node.sat_id for node in nodes}
         )
         self.pheromone = {node.node_id: float(self.params["tau0"]) for node in nodes}
         self.archive: List[Solution] = []
         self.runtime_seconds = 0.0
+        self._lambda_load = float(self.params.get("lambda_load", 1.0))
+        self._load_mode = str(self.params.get("load_mode", "task_count"))
+        if self._load_mode not in {"task_count", "duration"}:
+            raise ValueError(f"Unknown load_mode: {self._load_mode}")
         self.simple_heuristic = self._build_simple_heuristic()
         self._candidate_rank = sorted(
             (node.node_id for node in nodes),
@@ -104,7 +117,7 @@ class MOACO:
         for node in self.nodes:
             nid = node.node_id
             # Simple baseline: reward high profit and low maneuver pressure.
-            heuristic[nid] = max(1e-9, 0.8 * norm_profit.get(nid, 1.0) + 0.2 * maneuver_benefit.get(nid, 1.0))
+            heuristic[nid] = max(1e-9, 0.7 * norm_profit.get(nid, 1.0) + 0.3 * maneuver_benefit.get(nid, 1.0))
         return heuristic
 
     def _candidate_pool(self, available: set[int]) -> list[int]:
@@ -138,11 +151,109 @@ class MOACO:
 
         return pool or list(available)
 
+    def _dynamic_heuristic(
+        self,
+        node_id: int,
+        sat_loads: dict[int, float],
+        max_load: float | None = None,
+    ) -> float:
+        """Apply a dynamic satellite-load penalty to the base heuristic."""
+
+        node = self.nodes_by_id[node_id]
+        if max_load is None:
+            max_load = max(1.0, max(sat_loads.values()) if sat_loads else 1.0)
+        norm_load = sat_loads.get(node.sat_id, 0.0) / max_load
+        base_eta = self.simple_heuristic.get(node_id, 1.0)
+        return max(1e-9, base_eta / (1.0 + self._lambda_load * norm_load))
+
+    @staticmethod
+    def _insertion_index(
+        sequence: list[CandidateNode],
+        node: CandidateNode,
+    ) -> int:
+        """Return the chronological insertion position without graph lookups."""
+
+        node_key = (node.start, node.node_id)
+        low = 0
+        high = len(sequence)
+        while low < high:
+            middle = (low + high) // 2
+            middle_node = sequence[middle]
+            if (middle_node.start, middle_node.node_id) < node_key:
+                low = middle + 1
+            else:
+                high = middle
+        return low
+
+    def _can_insert_node(
+        self,
+        node: CandidateNode,
+        selected_tasks: set[int],
+        sat_sequences: dict[int, list[CandidateNode]],
+    ) -> bool:
+        """Check task, window, overlap, and transition constraints directly."""
+
+        if node.task_id in selected_tasks:
+            return False
+
+        node_end = node.start + node.task_duration
+        if not observation_fits_window(node.start, node.end, node.task_duration):
+            return False
+
+        sequence = sat_sequences.get(node.sat_id, [])
+        position = self._insertion_index(sequence, node)
+
+        if position > 0:
+            previous = sequence[position - 1]
+            previous_end = previous.start + previous.task_duration
+            transition = estimate_transition_time(previous, node, self.params)
+            if not time_not_after(previous_end + transition, node.start):
+                return False
+
+        if position < len(sequence):
+            following = sequence[position]
+            transition = estimate_transition_time(node, following, self.params)
+            if not time_not_after(node_end + transition, following.start):
+                return False
+
+        return True
+
+    def _insert_node(
+        self,
+        node: CandidateNode,
+        sat_sequences: dict[int, list[CandidateNode]],
+    ) -> None:
+        sequence = sat_sequences.setdefault(node.sat_id, [])
+        sequence.insert(self._insertion_index(sequence, node), node)
+
+    def _is_solution_feasible_direct(self, node_ids: Iterable[int]) -> bool:
+        """Validate a complete solution without a precomputed conflict graph."""
+
+        selected_tasks: set[int] = set()
+        sat_sequences: dict[int, list[CandidateNode]] = {
+            sat_id: [] for sat_id in self.satellite_ids
+        }
+        ordered_nodes = sorted(
+            (self.nodes_by_id[node_id] for node_id in node_ids),
+            key=lambda node: (node.start, node.node_id),
+        )
+        for node in ordered_nodes:
+            if not self._can_insert_node(node, selected_tasks, sat_sequences):
+                return False
+            selected_tasks.add(node.task_id)
+            self._insert_node(node, sat_sequences)
+        return True
+
     def construct_solution(self) -> set[int]:
-        """Construct one feasible schedule using plain MOACO selection."""
+        """Construct one feasible schedule using direct constraint checks."""
 
         solution: set[int] = set()
         available: set[int] = {node.node_id for node in self.nodes}
+        selected_tasks: set[int] = set()
+        sat_sequences: dict[int, list[CandidateNode]] = {
+            sat_id: [] for sat_id in self.satellite_ids
+        }
+        sat_loads = {sat_id: 0.0 for sat_id in self.satellite_ids}
 
         alpha = float(self.params["alpha"])
         beta = float(self.params["beta"])
@@ -151,18 +262,20 @@ class MOACO:
         while available:
             items = self._candidate_pool(available)
             weights = []
+            max_load = max(1.0, max(sat_loads.values()) if sat_loads else 1.0)
             for node_id in items:
                 tau = max(tau_min, self.pheromone[node_id])
-                eta = self.simple_heuristic.get(node_id, 1.0)
+                eta = self._dynamic_heuristic(node_id, sat_loads, max_load)
                 weights.append((tau ** alpha) * (eta ** beta))
 
             chosen = roulette_select(items, weights)
-            if not (self.conflict_adj.get(chosen, set()) & solution):
+            node = self.nodes_by_id[chosen]
+            if self._can_insert_node(node, selected_tasks, sat_sequences):
                 solution.add(chosen)
-                # Feasibility uses the same hard conflict constraints, but the
-                # selection rule does not exploit graph features.
-                available.discard(chosen)
-                available.difference_update(self.conflict_adj.get(chosen, set()))
+                selected_tasks.add(node.task_id)
+                self._insert_node(node, sat_sequences)
+                sat_loads[node.sat_id] += node_load_amount(node, self._load_mode)
+                available.difference_update(self.node_ids_by_task[node.task_id])
             else:
                 available.discard(chosen)
         return solution
@@ -203,13 +316,13 @@ class MOACO:
             population: List[Solution] = []
             for _ in range(num_ants):
                 constructed = self.construct_solution()
-                if validate_each_solution and not is_feasible(constructed, self.conflict_adj):
+                if validate_each_solution and not self._is_solution_feasible_direct(constructed):
                     continue
                 population.append(self._make_solution(constructed))
 
             if validate_interval > 0 and iteration % validate_interval == 0:
                 for idx, sol in enumerate(population):
-                    if not is_feasible(sol.node_ids, self.conflict_adj):
+                    if not self._is_solution_feasible_direct(sol.node_ids):
                         raise RuntimeError(
                             "MOACO produced infeasible solution at "
                             f"iteration {iteration}, population index {idx}"
@@ -228,7 +341,7 @@ class MOACO:
 
         if validate_final_archive:
             for idx, sol in enumerate(self.archive):
-                if not is_feasible(sol.node_ids, self.conflict_adj):
+                if not self._is_solution_feasible_direct(sol.node_ids):
                     raise RuntimeError(
                         f"MOACO final archive contains infeasible solution at index {idx}"
                     )

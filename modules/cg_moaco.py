@@ -13,14 +13,19 @@ import time
 from typing import Dict, Iterable, List, Sequence
 
 from .domain import CandidateNode, Task
-from .local_search import local_search
-from .problem_model import evaluate_solution, is_feasible, task_completion_rate
+from .local_search import pareto_local_search
+from .problem_model import (
+    evaluate_solution,
+    is_feasible,
+    node_load_amount,
+    task_completion_rate,
+)
 from .utils import (
     Solution,
     crowding_distance,
     roulette_select,
     set_random_seed,
-    update_archive,
+    update_archive_with_acceptance,
 )
 
 
@@ -39,23 +44,18 @@ DEFAULT_PARAMS = {
     "lambda_conflict": 1.0,
     "lambda_maneuver": 1.0,
     "lambda_load": 1.0,
-    "candidate_pool_size": 300,
-    "candidate_random_ratio": 0.15,
+    "candidate_pool_size": 200,
+    "candidate_random_ratio": 0.1,
     "min_transition_time": 5.0,
     "maneuver_time_per_degree": 0.2,
     "load_mode": "task_count",
     "enable_local_search": True,
     "enable_fast_insert": True,
     "enable_replacement": True,
-    "local_search_candidate_limit": 500,
-    "replacement_candidate_limit": 300,
+    "local_search_candidate_limit": 100,
     "use_graph_pheromone": True,
-    "replacement_attempts": 100,
+    "replacement_attempts": 30,
     "max_replace_conflicts": 3,
-    "min_replacement_profit_gain": 0.0,
-    "w_profit": 1.0,
-    "w_maneuver": 0.01,
-    "w_load": 1.0,
     "validate_each_solution": False,
     "validate_interval": 20,
     "validate_final_archive": True,
@@ -80,7 +80,11 @@ class CGMOACO:
         self.nodes = nodes
         self.nodes_by_id = {node.node_id: node for node in nodes}
         self.conflict_adj = conflict_adj
-        self.graph_features = graph_features
+        # Keep the expensive normalized graph features, but rebuild the
+        # weighted contribution with this experiment's effective lambda_*
+        # values. Parameter-analysis overrides must affect candidate ranking
+        # and graph-aware pheromone reinforcement as well as roulette scores.
+        self.graph_features = dict(graph_features)
         self.satellite_ids = sorted(
             set(satellite_ids) if satellite_ids is not None else {node.sat_id for node in nodes}
         )
@@ -88,9 +92,13 @@ class CGMOACO:
         self.archive: List[Solution] = []
         self.runtime_seconds = 0.0
 
+        self._load_mode = str(self.params.get("load_mode", "task_count"))
+        if self._load_mode not in {"task_count", "duration"}:
+            raise ValueError(f"Unknown load_mode: {self._load_mode}")
         self._lambda_load = float(self.params.get("lambda_load", 1.0))
         self._heuristic_numerator: dict[int, float] = {}
         self._heuristic_static_denominator: dict[int, float] = {}
+        weighted_contribution: dict[int, float] = {}
         for node in nodes:
             node_id = node.node_id
             self._heuristic_numerator[node_id] = (
@@ -105,6 +113,13 @@ class CGMOACO:
                 + float(self.params["lambda_maneuver"])
                 * self.graph_features["norm_maneuver"][node_id]
             )
+            weighted_contribution[node_id] = max(
+                1e-9,
+                self._heuristic_numerator[node_id]
+                / self._heuristic_static_denominator[node_id],
+            )
+
+        self.graph_features["contribution"] = weighted_contribution
 
         self._candidate_rank = sorted(
             (node.node_id for node in nodes),
@@ -147,7 +162,6 @@ class CGMOACO:
     def _dynamic_heuristic(
         self,
         node_id: int,
-        current_solution: set[int],
         sat_loads: dict[int, int | float],
         max_load: float | None = None,
     ) -> float:
@@ -164,7 +178,7 @@ class CGMOACO:
 
         solution: set[int] = set()
         available: set[int] = {node.node_id for node in self.nodes}
-        sat_loads = {sat_id: 0 for sat_id in self.satellite_ids}
+        sat_loads = {sat_id: 0.0 for sat_id in self.satellite_ids}
 
         alpha = float(self.params["alpha"])
         beta = float(self.params["beta"])
@@ -176,18 +190,19 @@ class CGMOACO:
             max_load = max(1.0, max(sat_loads.values()) if sat_loads else 1.0)
             for node_id in items:
                 tau = max(tau_min, self.pheromone[node_id])
-                eta = self._dynamic_heuristic(node_id, solution, sat_loads, max_load)
+                eta = self._dynamic_heuristic(node_id, sat_loads, max_load)
                 weights.append((tau ** alpha) * (eta ** beta))
 
             chosen = roulette_select(items, weights)
-            if not (self.conflict_adj.get(chosen, set()) & solution):
-                solution.add(chosen)
-                sat_loads[self.nodes_by_id[chosen].sat_id] += 1
-                # Remove chosen node and everything incompatible with it.
-                available.discard(chosen)
-                available.difference_update(self.conflict_adj.get(chosen, set()))
-            else:
-                available.discard(chosen)
+            solution.add(chosen)
+            chosen_node = self.nodes_by_id[chosen]
+            sat_loads[chosen_node.sat_id] += node_load_amount(
+                chosen_node,
+                self._load_mode,
+            )
+            # The available set contains only nodes compatible with solution.
+            available.discard(chosen)
+            available.difference_update(self.conflict_adj.get(chosen, set()))
         return solution
 
     def _make_solution(self, node_ids: Iterable[int]) -> Solution:
@@ -240,19 +255,28 @@ class CGMOACO:
             population: List[Solution] = []
             for _ in range(num_ants):
                 constructed = self.construct_solution()
-                improved = local_search(
-                    constructed,
-                    self.nodes,
-                    self.nodes_by_id,
-                    self.conflict_adj,
-                    self.tasks,
-                    self.satellite_ids,
-                    self.graph_features,
-                    self.params,
-                )
-                if validate_each_solution and not is_feasible(improved, self.conflict_adj):
+                if validate_each_solution and not is_feasible(constructed, self.conflict_adj):
                     continue
-                population.append(self._make_solution(improved))
+
+                current = self._make_solution(constructed)
+                self.archive, entered_archive = update_archive_with_acceptance(
+                    self.archive,
+                    current,
+                    archive_size,
+                )
+                if entered_archive and self.params.get("enable_local_search", True):
+                    current, self.archive, _ = pareto_local_search(
+                        current,
+                        self.archive,
+                        archive_size,
+                        self.nodes,
+                        self.nodes_by_id,
+                        self.conflict_adj,
+                        self.tasks,
+                        self.satellite_ids,
+                        self.params,
+                    )
+                population.append(current)
 
             if validate_interval > 0 and iteration % validate_interval == 0:
                 for idx, sol in enumerate(population):
@@ -262,7 +286,6 @@ class CGMOACO:
                             f"iteration {iteration}, population index {idx}"
                         )
 
-            self.archive = update_archive(self.archive, population, archive_size)
             self._evaporate_pheromone()
             self._update_pheromone_by_archive()
 

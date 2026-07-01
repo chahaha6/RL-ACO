@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import csv
+import math
 import random
 import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
 
 from .domain import CandidateNode, Task
-from .problem_model import DEFAULT_MODEL_PARAMS, evaluate_solution, is_feasible, task_completion_rate
+from .problem_model import DEFAULT_MODEL_PARAMS, evaluate_solution, task_completion_rate
 from .utils import Solution, dominates, set_random_seed, update_archive
 
 
@@ -203,23 +204,6 @@ class NSGA2:
 
         return solution
 
-    def _repair_by_conflict_removal(self, node_ids: Iterable[int]) -> set[int]:
-        """防御性修复：若解中存在冲突，则按收益优先保留节点。"""
-
-        repaired: set[int] = set()
-
-        ordered = sorted(
-            node_ids,
-            key=lambda nid: self.nodes_by_id[nid].profit,
-            reverse=True,
-        )
-
-        for nid in ordered:
-            if not (self.conflict_adj.get(nid, set()) & repaired):
-                repaired.add(nid)
-
-        return repaired
-
     def _make_solution(self, node_ids: Iterable[int]) -> Solution:
         """根据 node_id 集合构造 Solution 对象。"""
 
@@ -242,10 +226,6 @@ class NSGA2:
         """评价一条染色体。"""
 
         node_ids = self._decode_chromosome(chromosome)
-
-        if not is_feasible(node_ids, self.conflict_adj):
-            node_ids = self._repair_by_conflict_removal(node_ids)
-
         return self._make_solution(node_ids)
 
     def _make_individual(self, chromosome: Sequence[float]) -> _Individual:
@@ -326,12 +306,14 @@ class NSGA2:
         for m in range(num_objectives):
             front.sort(key=lambda ind: ind.solution.objectives[m])
 
-            front[0].crowding_distance = float("inf")
-            front[-1].crowding_distance = float("inf")
-
             min_obj = front[0].solution.objectives[m]
             max_obj = front[-1].solution.objectives[m]
-            denom = max(max_obj - min_obj, 1e-12)
+            denom = max_obj - min_obj
+            if math.isclose(denom, 0.0, abs_tol=1e-12):
+                continue
+
+            front[0].crowding_distance = float("inf")
+            front[-1].crowding_distance = float("inf")
 
             for i in range(1, len(front) - 1):
                 prev_obj = front[i - 1].solution.objectives[m]

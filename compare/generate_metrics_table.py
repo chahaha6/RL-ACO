@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from experiment_postprocess import generate_metrics_table
+from compare.experiment_selection import SELECTED_CASE_NAMES
 
 
 EXPERIMENT_DIR = Path(__file__).resolve().parent
@@ -35,7 +36,7 @@ ALGORITHM_ORDER = [
 
 ALGORITHM_STYLE = {
     "CG-MOACO": ("#0F4D92", "o", 2.4),
-    "MOACO": ("#3775BA", "s", 1.5),
+    # "MOACO": ("#5CBA37", "s", 1.5),
     "MODBO": ("#B64342", "^", 1.5),
     "MOPSO": ("#42949E", "D", 1.5),
     "SPEA2": ("#9A4D8E", "P", 1.5),
@@ -178,5 +179,6 @@ if __name__ == "__main__":
         output_dir=EXPERIMENT_DIR,
         tag_aliases=TAG_ALIASES,
         title="Comparison experiment metrics",
+        case_names=SELECTED_CASE_NAMES,
     )
     plot_metrics_comparison(metric_rows, EXPERIMENT_DIR)

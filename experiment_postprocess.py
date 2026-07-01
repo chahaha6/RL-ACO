@@ -61,7 +61,7 @@ def read_archive_points(path: Path) -> list[dict]:
     with path.open("r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames:
-            return []
+            raise ValueError(f"Pareto file has no header: {path}")
 
         has_f_objectives = all(key in reader.fieldnames for key in OBJECTIVE_KEYS)
         has_named_objectives = all(
@@ -69,9 +69,12 @@ def read_archive_points(path: Path) -> list[dict]:
             for key in ("profit", "load", "attitude")
         )
         if not has_f_objectives and not has_named_objectives:
-            return []
+            raise ValueError(
+                f"Pareto file has no recognized objective columns: {path}; "
+                f"columns={reader.fieldnames}"
+            )
 
-        for row in reader:
+        for line_no, row in enumerate(reader, start=2):
             try:
                 if has_f_objectives:
                     f1 = float(row["f1"])
@@ -82,8 +85,15 @@ def read_archive_points(path: Path) -> list[dict]:
                     f1 = -profit if profit < 0 else profit
                     f2 = float(row["attitude"])
                     f3 = float(row["load"])
-            except (TypeError, ValueError):
-                continue
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid objective value in {path} at line {line_no}: {row}"
+                ) from exc
+            if not all(math.isfinite(value) for value in (f1, f2, f3)):
+                raise ValueError(
+                    f"Non-finite objective value in {path} at line {line_no}: "
+                    f"{(f1, f2, f3)}"
+                )
             point = {
                 "run": str(row.get("Run", "1")),
                 "f1": f1,
@@ -98,10 +108,12 @@ def read_archive_points(path: Path) -> list[dict]:
 def discover_archives(
     input_dir: Path,
     tag_aliases: dict[str, tuple[str, str]],
+    case_names: Iterable[str] | None = None,
 ) -> list[dict]:
     archives = []
     if not input_dir.exists():
         return archives
+    allowed_cases = set(case_names) if case_names is not None else None
 
     for path in sorted(input_dir.glob("**/*.csv")):
         parsed = parse_archive_filename(path)
@@ -118,6 +130,8 @@ def discover_archives(
             case_name = f"t{task_count}"
         else:
             case_name = path.parent.name
+        if allowed_cases is not None and case_name not in allowed_cases:
+            continue
         archives.append(
             {
                 "path": path,
@@ -130,6 +144,74 @@ def discover_archives(
             }
         )
     return archives
+
+
+def validate_archive_coverage(
+    archives: list[dict],
+    tag_aliases: dict[str, tuple[str, str]],
+    case_names: Iterable[str] | None = None,
+) -> None:
+    """Require every selected case to contain every configured algorithm/run."""
+
+    if not archives:
+        raise FileNotFoundError("No Pareto archive files were found.")
+
+    expected_tags = {
+        canonical_tag: label
+        for canonical_tag, label in tag_aliases.values()
+    }
+    selected_cases = set(case_names) if case_names is not None else {
+        archive["case"] for archive in archives
+    }
+    by_case: dict[str, list[dict]] = defaultdict(list)
+    for archive in archives:
+        by_case[archive["case"]].append(archive)
+
+    missing = []
+    duplicate = []
+    run_mismatches = []
+    for case_name in sorted(selected_cases):
+        case_archives = by_case.get(case_name, [])
+        by_tag: dict[str, list[dict]] = defaultdict(list)
+        for archive in case_archives:
+            by_tag[archive["tag"]].append(archive)
+
+        for tag, label in expected_tags.items():
+            matches = by_tag.get(tag, [])
+            if not matches:
+                missing.append(f"{case_name}/{label}")
+            elif len(matches) > 1:
+                duplicate.append(
+                    f"{case_name}/{label}: "
+                    + ", ".join(str(item["path"]) for item in matches)
+                )
+
+        complete_archives = [
+            by_tag[tag][0]
+            for tag in expected_tags
+            if len(by_tag.get(tag, [])) == 1
+        ]
+        if complete_archives:
+            expected_runs = {
+                point["run"] for point in complete_archives[0]["points"]
+            }
+            for archive in complete_archives[1:]:
+                actual_runs = {point["run"] for point in archive["points"]}
+                if actual_runs != expected_runs:
+                    run_mismatches.append(
+                        f"{case_name}/{archive['label']}: "
+                        f"runs={sorted(actual_runs)}, expected={sorted(expected_runs)}"
+                    )
+
+    errors = []
+    if missing:
+        errors.append("Missing Pareto data: " + ", ".join(missing))
+    if duplicate:
+        errors.append("Duplicate Pareto data: " + "; ".join(duplicate))
+    if run_mismatches:
+        errors.append("Inconsistent run sets: " + "; ".join(run_mismatches))
+    if errors:
+        raise ValueError("\n".join(errors))
 
 
 def dominates(a: tuple[float, ...], b: tuple[float, ...], eps: float = 1e-12) -> bool:
@@ -250,8 +332,10 @@ def igd(
 ) -> float:
     point_list = list(points)
     ref_list = list(reference_points)
-    if not point_list or not ref_list:
-        return 0.0
+    if not ref_list:
+        raise ValueError("IGD reference front is empty")
+    if not point_list:
+        return float("inf")
 
     distances = []
     for ref in ref_list:
@@ -395,11 +479,14 @@ def generate_metrics_table(
     output_dir: Path,
     tag_aliases: dict[str, tuple[str, str]],
     title: str,
+    case_names: Iterable[str] | None = None,
 ) -> list[dict]:
     search_dir = input_dir if input_dir is not None else (root / "results" if root is not None else None)
     if search_dir is None:
         raise ValueError("Either input_dir or root must be provided.")
-    archives = discover_archives(search_dir, tag_aliases)
+    selected_cases = set(case_names) if case_names is not None else None
+    archives = discover_archives(search_dir, tag_aliases, selected_cases)
+    validate_archive_coverage(archives, tag_aliases, selected_cases)
     rows = metric_rows_for_archives(archives)
     write_metrics_csv(rows, output_dir / "metrics_table.csv")
     write_metrics_tex(rows, output_dir / "metrics_table.tex", title)
@@ -443,6 +530,7 @@ def generate_pareto_plots(
     output_dir: Path,
     tag_aliases: dict[str, tuple[str, str]],
     title: str,
+    case_names: Iterable[str] | None = None,
 ) -> list[Path]:
     import matplotlib
 
@@ -462,7 +550,9 @@ def generate_pareto_plots(
     search_dir = input_dir if input_dir is not None else (root / "results" if root is not None else None)
     if search_dir is None:
         raise ValueError("Either input_dir or root must be provided.")
-    archives = discover_archives(search_dir, tag_aliases)
+    selected_cases = set(case_names) if case_names is not None else None
+    archives = discover_archives(search_dir, tag_aliases, selected_cases)
+    validate_archive_coverage(archives, tag_aliases, selected_cases)
     plot_data = collect_plot_points(archives)
     output_dir.mkdir(parents=True, exist_ok=True)
 

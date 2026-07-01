@@ -7,7 +7,7 @@ import math
 from typing import Sequence
 
 from .domain import CandidateNode
-from .problem_model import estimate_transition_time
+from .problem_model import attitude_transition_time, estimate_transition_time
 
 
 GLOBAL_FEATURE_DIM = 8
@@ -33,17 +33,60 @@ def max_load_std(total_tasks: int, satellite_count: int) -> float:
 def transition_reference(nodes: Sequence[CandidateNode], params: dict) -> float:
     if not nodes:
         return 1.0
+
     coord_1_values = [node.coord_1 for node in nodes]
     coord_2_values = [node.coord_2 for node in nodes]
     diagonal = math.hypot(
         max(coord_1_values) - min(coord_1_values),
         max(coord_2_values) - min(coord_2_values),
     )
-    return max(
-        1.0,
+    single_transition_refs = [
         float(params.get("min_transition_time", 5.0))
         + float(params.get("maneuver_time_per_degree", 0.2)) * diagonal,
-    )
+    ]
+
+    if params.get("use_attitude_transition_time", True):
+        by_satellite: dict[int, list[CandidateNode]] = {}
+        for node in nodes:
+            by_satellite.setdefault(node.sat_id, []).append(node)
+
+        for sat_nodes in by_satellite.values():
+            previous_rolls = [
+                node.end_roll if node.end_roll is not None else node.roll
+                for node in sat_nodes
+            ]
+            previous_pitches = [
+                node.end_pitch if node.end_pitch is not None else node.pitch
+                for node in sat_nodes
+            ]
+            next_rolls = [node.roll for node in sat_nodes]
+            next_pitches = [node.pitch for node in sat_nodes]
+            if any(value is None for value in [
+                *previous_rolls,
+                *previous_pitches,
+                *next_rolls,
+                *next_pitches,
+            ]):
+                continue
+
+            prev_roll_values = [float(value) for value in previous_rolls]
+            prev_pitch_values = [float(value) for value in previous_pitches]
+            next_roll_values = [float(value) for value in next_rolls]
+            next_pitch_values = [float(value) for value in next_pitches]
+            max_roll_delta = max(
+                max(prev_roll_values) - min(next_roll_values),
+                max(next_roll_values) - min(prev_roll_values),
+            )
+            max_pitch_delta = max(
+                max(prev_pitch_values) - min(next_pitch_values),
+                max(next_pitch_values) - min(prev_pitch_values),
+            )
+            single_transition_refs.append(
+                attitude_transition_time(max_roll_delta + max_pitch_delta)
+            )
+
+    # Inserting a node between two observations can introduce two transitions.
+    return max(1.0, 2.0 * max(single_transition_refs))
 
 
 def incremental_maneuver_cost(
@@ -78,7 +121,9 @@ def insert_sorted_by_start(sequence: list[CandidateNode], node: CandidateNode) -
 def block_penalty(
     node_id: int,
     available: set[int],
-    profit_by_id: dict[int, float],
+    task_id_by_node: dict[int, int],
+    profit_by_task: dict[int, float],
+    available_task_node_counts: dict[int, int],
     conflict_adj: dict[int, set[int]],
     available_profit_sum: float,
     *,
@@ -86,7 +131,20 @@ def block_penalty(
 ) -> float:
     if not enabled or available_profit_sum <= 0:
         return 0.0
-    blocked_profit = sum(profit_by_id[nid] for nid in conflict_adj.get(node_id, set()) & available)
+
+    selected_task_id = task_id_by_node[node_id]
+    conflict_count_by_task: dict[int, int] = {}
+    for conflict_id in conflict_adj.get(node_id, set()) & available:
+        task_id = task_id_by_node[conflict_id]
+        if task_id == selected_task_id:
+            continue
+        conflict_count_by_task[task_id] = conflict_count_by_task.get(task_id, 0) + 1
+
+    blocked_profit = sum(
+        profit_by_task[task_id]
+        for task_id, conflict_count in conflict_count_by_task.items()
+        if conflict_count >= available_task_node_counts.get(task_id, 0) > 0
+    )
     return min(1.0, max(0.0, blocked_profit / available_profit_sum))
 
 
@@ -114,14 +172,18 @@ def build_global_features(
         avg_conflict = sum(norm_conflict.get(nid, 0.0) for nid in available) / len(available)
 
     max_load = max((sat_loads.get(sat_id, 0.0) for sat_id in satellite_ids), default=0.0)
+    total_solution_load = sum(float(value) for value in sat_loads.values())
+    normalized_maneuver = current_maneuver / (
+        max(1.0, transition_ref) * max(1, solution_size)
+    )
     return [
         solution_size / max(1, task_count),
         selected_profit / max(1.0, total_profit),
         available_size / max(1, node_count),
-        current_maneuver / max(1.0, transition_ref),
+        min(1.0, max(0.0, normalized_maneuver)),
         load_std_from_loads(sat_loads, satellite_ids) / max(1.0, load_std_ref),
         avg_conflict,
-        max_load / max(1, solution_size),
+        max_load / max(1.0, total_solution_load),
         archive_size / max(1, archive_limit),
     ]
 
@@ -131,7 +193,7 @@ def build_node_features(
     node: CandidateNode,
     graph_features: dict[str, dict[int, float]],
     sat_loads: dict[int, float],
-    solution_size: int,
+    total_solution_load: float,
     tau: float,
     tau_min: float,
     tau_max: float,
@@ -147,8 +209,8 @@ def build_node_features(
         graph_features.get("norm_profit", {}).get(nid, 0.0),
         graph_features.get("norm_scarcity", {}).get(nid, 0.0),
         graph_features.get("norm_conflict", {}).get(nid, 0.0),
-        maneuver_delta / max(1.0, transition_ref),
-        sat_loads.get(node.sat_id, 0.0) / max(1, solution_size),
+        min(1.0, max(0.0, maneuver_delta / max(1.0, transition_ref))),
+        sat_loads.get(node.sat_id, 0.0) / max(1.0, total_solution_load),
         tau_norm,
         min(1.0, max(0.0, eta)),
         min(1.0, max(0.0, block_value)),
@@ -168,9 +230,11 @@ def construction_score(
     block_coef: float,
 ) -> float:
     profit_gain = profit / max(1.0, max_profit)
-    maneuver_gain = maneuver_delta / max(1.0, transition_ref)
-    load_delta = (load_after - load_before) / max(1.0, load_std_ref)
+    maneuver_gain = min(1.0, max(0.0, maneuver_delta / max(1.0, transition_ref)))
+    load_delta = min(
+        1.0,
+        max(-1.0, (load_after - load_before) / max(1.0, load_std_ref)),
+    )
     score = (profit_gain - maneuver_gain - load_delta) / 3.0
     score -= float(block_coef) * block_value
     return max(-1.0, min(1.0, score))
-

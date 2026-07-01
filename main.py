@@ -35,7 +35,7 @@ from modules.spea2 import SPEA2, DEFAULT_PARAMS as SPEA2_DEFAULT_PARAMS
 from modules.conflict_graph import build_conflict_graph, compute_graph_features
 from modules.domain import CandidateNode, Task
 from modules.problem_model import DEFAULT_MODEL_PARAMS, task_completion_rate
-from modules.utils import Solution, format_seconds
+from modules.utils import Solution, format_seconds, observation_fits_window
 
 
 # =========================================================
@@ -78,7 +78,7 @@ RUN_MOACO = True
 RUN_NSGA2 = False
 
 # ---------- 消融实验 ----------
-# Original CG-MOACO mechanism ablations.
+# RL-CG-MOACO component ablations.
 RUN_RL_ABLATION_EXPERIMENTS = False
 RUN_RL_CG_MOACO_NO_DDQN = False
 RUN_RL_CG_MOACO_NO_BLOCK_PENALTY = False
@@ -105,6 +105,9 @@ VERBOSE = True
 # 修改这些值后，冲突图构建和各算法目标评价会同步更新。
 MODEL_PARAMS = {
     **DEFAULT_MODEL_PARAMS,
+    # "task_count"：按每颗卫星执行的任务数量计算负载；
+    # "duration"：按每颗卫星累计观测时间计算负载。
+    "load_mode": "task_count",
 }
 
 # =========================================================
@@ -124,7 +127,7 @@ OVERWRITE_RESULT_CSV = False
 # 这些参数是你算法创新机制相关参数：
 #   1. 冲突图启发式构造机制
 #   2. 冲突图感知 Pareto 信息素更新
-#   3. 冲突图感知快速插入-替换局部搜索
+#   3. 冲突图感知替换-插入补全复合局部搜索
 
 CG_EXTRA_PARAMS = {
     # ---------- 冲突图启发式函数权重 ----------
@@ -134,10 +137,10 @@ CG_EXTRA_PARAMS = {
     # lambda_load：卫星负载惩罚权重
     "lambda_scarcity": 1.0,
     "lambda_conflict": 1.0,
-    "lambda_maneuver": 1.0,
+    "lambda_maneuver": 1.1,
     "lambda_load": 1.0,
 
-    # ---------- 候选受限构造参数 ----------
+    # ---------- 蚁群构造阶段 ----------
     # candidate_pool_size：每一步最多进入概率选择的候选节点数；<=0 表示不限制
     # candidate_random_ratio：候选池中随机探索节点比例，防止过早收敛
     "candidate_pool_size": 300,
@@ -145,41 +148,29 @@ CG_EXTRA_PARAMS = {
 
     # ---------- 局部搜索开关 ----------
     # enable_local_search：是否启用冲突图感知局部搜索
-    # enable_fast_insert：是否启用快速插入操作
-    # enable_replacement：是否启用替换操作
+    # enable_fast_insert：是否在替换释放空间后执行随机插入补全
+    # enable_replacement：是否启用替换及其插入补全复合邻域
     "enable_local_search": True,
     "enable_fast_insert": True,
     "enable_replacement": True,
 
-    # local_search_candidate_limit：快速插入阶段最多排序/检查的候选节点数；<=0 表示不限制
-    # replacement_candidate_limit：替换阶段最多排序/检查的候选节点数；<=0 表示不限制
-    "local_search_candidate_limit": 500,
-    "replacement_candidate_limit": 300,
+    # local_search_candidate_limit：每个替换基解最多随机尝试的补全节点数；<=0 表示不限制
+    "local_search_candidate_limit": 100,
 
     # ---------- 信息素更新开关 ----------
     # use_graph_pheromone：是否使用冲突图贡献度引导信息素更新
     "use_graph_pheromone": True,
 
-    # ---------- 替换局部搜索参数 ----------
-    # replacement_attempts：每个解最多尝试替换的次数
+    # ---------- 替换-插入补全局部搜索参数 ----------
+    # replacement_attempts：随机采样的替换基解数量；<=0 表示不限制
     # max_replace_conflicts：一次替换允许涉及的最大冲突节点数
-    # min_replacement_profit_gain：执行替换所需的最小收益增益
     "replacement_attempts": 30,
     "max_replace_conflicts": 3,
-    "min_replacement_profit_gain": 2.0,
-
-    # ---------- 多目标替换增益权重 ----------
-    # w_profit：收益改善权重
-    # w_maneuver：姿态机动代价变化权重
-    # w_load：负载均衡变化权重
-    "w_profit": 1.0,
-    "w_maneuver": 0.01,
-    "w_load": 1.0,
 
     # ---------- 可行性验证 ----------
-    # 默认跳过每只蚂蚁的全量验证，每 20 代抽查并在返回前验证最终档案。
+    # 默认跳过每只蚂蚁的全量验证，每 30 代抽查并在返回前验证最终档案。
     "validate_each_solution": False,
-    "validate_interval": 20,
+    "validate_interval": 30,
     "validate_final_archive": True,
 }
 
@@ -327,10 +318,12 @@ def read_candidate_nodes_csv(file_path: str | Path) -> list[CandidateNode]:
                 end_pitch=optional_float(row, "end_pitch"),
                 end_yaw=optional_float(row, "end_yaw"),
             )
-            if node.duration + 1e-9 < node.task_duration:
+            if not observation_fits_window(node.start, node.end, node.task_duration):
+                actual_duration = node.end - node.start
                 raise ValueError(
                     f"Invalid candidate node {node.node_id} in {path}: "
-                    f"window duration {node.duration} < task duration {node.task_duration}. "
+                    f"end-start {actual_duration:.9f} < task duration "
+                    f"{node.task_duration:.9f}. "
                     "Regenerate CSV files with modules/data_process.py."
                 )
             nodes.append(node)
@@ -529,7 +522,7 @@ def build_problem_interface(
     # 注意：
     #   冲突图属于问题结构，不属于某个算法私有模块。
     #   CG-MOACO 会深度使用冲突图；
-    #   MOACO 只用冲突图做普通可行性判断。
+    #   MOACO 不接收冲突图，在算法内直接检查调度约束。
     #
     # 冲突图使用统一的问题模型参数；图特征额外使用 CG-MOACO 的
     # 冲突图启发式权重。
@@ -693,6 +686,16 @@ def enabled_experiments() -> list[ExperimentSpec]:
             )
 
     if RUN_RL_ABLATION_EXPERIMENTS:
+        if not any(spec.tag == "rl_cg_moaco" for spec in experiments):
+            experiments.append(
+                ExperimentSpec(
+                    "rl_cg_moaco",
+                    "RL-CG-MOACO",
+                    "rl_cg_moaco",
+                    {},
+                    "rl_ablation",
+                )
+            )
         if RUN_RL_CG_MOACO_NO_DDQN:
             experiments.append(
                 ExperimentSpec(
@@ -909,7 +912,6 @@ def build_algorithm(spec: ExperimentSpec, problem: dict, run_idx: int):
         return MOACO(
             tasks=tasks,
             nodes=nodes,
-            conflict_adj=conflict_adj,
             satellite_ids=satellite_ids,
             params=params,
         )
@@ -1201,8 +1203,9 @@ def run_one_experiment(
             schedule_rows,
         )
 
-    for run_idx in pending_runs:
-        result = run_single_round(spec, problem, run_idx, nodes_by_id)
+    def save_completed_run(result: RunResult) -> None:
+        nonlocal average_rows, per_rows, schedule_rows
+        run_idx = result.run_idx
 
         # 若恢复文件里残留了未完成轮次的数据，先替换该轮，避免重复。
         average_rows = [row for row in average_rows if int(row["Run"]) != run_idx]
@@ -1223,6 +1226,11 @@ def run_one_experiment(
         print(
             f"Run {run_idx} saved immediately "
             f"({len(average_rows)}/{RUN_COUNT} completed)."
+        )
+
+    for run_idx in pending_runs:
+        save_completed_run(
+            run_single_round(spec, problem, run_idx, nodes_by_id)
         )
 
     # 所有轮次完成后再追加 Average 和 Std 行。

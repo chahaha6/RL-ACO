@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
 
 from .domain import CandidateNode, Task
-from .problem_model import DEFAULT_MODEL_PARAMS, evaluate_solution, is_feasible, task_completion_rate
+from .problem_model import DEFAULT_MODEL_PARAMS, evaluate_solution, task_completion_rate
 from .utils import Solution, dominates, set_random_seed, update_archive
 
 
@@ -95,12 +95,6 @@ class SPEA2:
 
     def _evaluate_position(self, position: Sequence[float]) -> Solution:
         node_ids = self._decode_position(position)
-        if not is_feasible(node_ids, self.conflict_adj):
-            repaired: set[int] = set()
-            for nid in sorted(node_ids, key=lambda x: self.nodes_by_id[x].profit, reverse=True):
-                if not (self.conflict_adj.get(nid, set()) & repaired):
-                    repaired.add(nid)
-            node_ids = repaired
         return self._make_solution(node_ids)
 
     def _distance(self, a: Solution, b: Solution) -> float:
